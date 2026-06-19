@@ -35,6 +35,96 @@ from gaze_features import (
 from risk_engine import RiskEngine
 from report_generator import save_session, generate_report_data
 
+
+
+# Helper: Simulate Task Features (for demo mode)
+# ══════════════════════════════════════════════════════════════════════
+def _simulate_task_features(task_id, rois, child_info):
+    """Generate realistic simulated features for demonstration."""
+    np.random.seed(hash(task_id + st.session_state.session_id) % (2**31))
+    
+    features = {}
+    
+    # Common scanpath features
+    features["fix_count"] = int(np.random.randint(8, 25))
+    features["fix_duration_total_ms"] = float(np.random.uniform(3000, 8000))
+    features["fix_duration_mean_ms"] = features["fix_duration_total_ms"] / features["fix_count"]
+    features["fix_duration_median_ms"] = features["fix_duration_mean_ms"] * np.random.uniform(0.8, 1.2)
+    features["fix_duration_std_ms"] = float(np.random.uniform(40, 180))
+    features["fix_duration_max_ms"] = features["fix_duration_mean_ms"] + features["fix_duration_std_ms"] * 2
+    features["fix_duration_min_ms"] = max(50, features["fix_duration_mean_ms"] - features["fix_duration_std_ms"])
+    features["saccade_count"] = features["fix_count"] - 1
+    features["saccade_amplitude_mean_px"] = float(np.random.uniform(50, 180))
+    features["saccade_amplitude_std_px"] = float(np.random.uniform(20, 80))
+    features["saccade_amplitude_max_px"] = features["saccade_amplitude_mean_px"] * 2
+    features["saccade_duration_mean_ms"] = float(np.random.uniform(20, 60))
+    features["scanpath_length_px"] = features["saccade_amplitude_mean_px"] * features["saccade_count"]
+    features["fix_distance_to_center_mean_px"] = float(np.random.uniform(80, 250))
+    features["fix_distance_to_center_std_px"] = float(np.random.uniform(30, 100))
+    features["fix_spatial_dispersion_px"] = float(np.random.uniform(50, 180))
+    features["gaze_range_x_px"] = float(np.random.uniform(200, 600))
+    features["gaze_range_y_px"] = float(np.random.uniform(150, 450))
+    features["gaze_range_ratio"] = (features["gaze_range_x_px"] * features["gaze_range_y_px"]) / (800 * 600)
+    features["fixation_rate_per_sec"] = features["fix_count"] / (features["fix_duration_total_ms"] / 1000)
+    features["blink_count"] = int(np.random.randint(1, 6))
+    features["blink_duration_mean_ms"] = float(np.random.uniform(100, 300))
+    features["repetitive_scan_index"] = float(np.random.uniform(0.05, 0.35))
+    features["revisit_ratio"] = float(np.random.uniform(0.1, 0.5))
+    features["session_duration_s"] = float(TASK_CONFIGS[task_id]["duration_seconds"])
+
+    # Task-specific features
+    if task_id == "face_preference":
+        features["face_preference_ratio"] = float(np.random.uniform(0.35, 0.80))
+        features["face_dwell_ratio"] = float(np.random.uniform(0.25, 0.60))
+        features["object_dwell_ratio"] = float(np.random.uniform(0.15, 0.50))
+        features["eye_region_fixation_ratio"] = float(np.random.uniform(0.05, 0.30))
+
+    elif task_id == "social_scene":
+        features["face_dwell_ratio"] = float(np.random.uniform(0.15, 0.50))
+        features["eye_region_fixation_ratio"] = float(np.random.uniform(0.08, 0.35))
+        features["object_dwell_ratio"] = float(np.random.uniform(0.10, 0.35))
+        for roi_name in rois:
+            features[f"roi_{roi_name}_dwell_ratio"] = float(np.random.uniform(0.05, 0.40))
+            features[f"roi_{roi_name}_fix_count"] = int(np.random.randint(1, 8))
+            features[f"roi_{roi_name}_first_fix_latency_ms"] = float(np.random.uniform(200, 2000))
+
+    elif task_id == "smooth_pursuit":
+        features["pursuit_accuracy_mean_px"] = float(np.random.uniform(30, 150))
+        features["pursuit_accuracy_std_px"] = float(np.random.uniform(15, 60))
+        features["pursuit_gain"] = float(np.random.uniform(0.5, 1.3))
+
+    elif task_id == "joint_attention":
+        for roi_name in rois:
+            features[f"roi_{roi_name}_dwell_ratio"] = float(np.random.uniform(0.1, 0.5))
+            features[f"roi_{roi_name}_fix_count"] = int(np.random.randint(1, 6))
+            features[f"roi_{roi_name}_first_fix_latency_ms"] = float(np.random.uniform(150, 1500))
+
+    elif task_id == "anti_saccade":
+        features["anti_saccade_correct"] = int(np.random.choice([0, 1], p=[0.3, 0.7]))
+        features["anti_saccade_error"] = 1 - features["anti_saccade_correct"]
+        features["anti_saccade_latency_ms"] = float(np.random.uniform(150, 600))
+
+    elif task_id == "sustained_attention":
+        features["sustained_hits"] = int(np.random.randint(3, 8))
+        features["sustained_misses"] = int(np.random.randint(0, 4))
+        features["sustained_false_alarms"] = int(np.random.randint(0, 3))
+        features["sustained_correct_rejections"] = int(np.random.randint(3, 8))
+        total_t = features["sustained_hits"] + features["sustained_misses"]
+        total_nt = features["sustained_false_alarms"] + features["sustained_correct_rejections"]
+        features["sustained_omission_rate"] = features["sustained_misses"] / total_t if total_t > 0 else 0
+        features["sustained_commission_rate"] = features["sustained_false_alarms"] / total_nt if total_nt > 0 else 0
+        features["sustained_mean_rt_ms"] = float(np.random.uniform(300, 800))
+        features["sustained_d_prime"] = float(np.random.uniform(0.5, 3.0))
+
+    elif task_id == "pattern_recognition":
+        for roi_name in rois:
+            features[f"roi_{roi_name}_dwell_ratio"] = float(np.random.uniform(0.1, 0.4))
+            features[f"roi_{roi_name}_fix_count"] = int(np.random.randint(1, 5))
+            features[f"roi_{roi_name}_first_fix_latency_ms"] = float(np.random.uniform(500, 4000))
+
+    return features
+
+
 # ── Page Config ───────────────────────────────────────────────────────
 st.set_page_config(page_title=f"{APP_TITLE} — New Screening", page_icon="👶", layout="wide")
 
@@ -460,89 +550,3 @@ elif st.session_state.screening_step == "complete":
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Helper: Simulate Task Features (for demo mode)
-# ══════════════════════════════════════════════════════════════════════
-def _simulate_task_features(task_id, rois, child_info):
-    """Generate realistic simulated features for demonstration."""
-    np.random.seed(hash(task_id + st.session_state.session_id) % (2**31))
-    
-    features = {}
-    
-    # Common scanpath features
-    features["fix_count"] = int(np.random.randint(8, 25))
-    features["fix_duration_total_ms"] = float(np.random.uniform(3000, 8000))
-    features["fix_duration_mean_ms"] = features["fix_duration_total_ms"] / features["fix_count"]
-    features["fix_duration_median_ms"] = features["fix_duration_mean_ms"] * np.random.uniform(0.8, 1.2)
-    features["fix_duration_std_ms"] = float(np.random.uniform(40, 180))
-    features["fix_duration_max_ms"] = features["fix_duration_mean_ms"] + features["fix_duration_std_ms"] * 2
-    features["fix_duration_min_ms"] = max(50, features["fix_duration_mean_ms"] - features["fix_duration_std_ms"])
-    features["saccade_count"] = features["fix_count"] - 1
-    features["saccade_amplitude_mean_px"] = float(np.random.uniform(50, 180))
-    features["saccade_amplitude_std_px"] = float(np.random.uniform(20, 80))
-    features["saccade_amplitude_max_px"] = features["saccade_amplitude_mean_px"] * 2
-    features["saccade_duration_mean_ms"] = float(np.random.uniform(20, 60))
-    features["scanpath_length_px"] = features["saccade_amplitude_mean_px"] * features["saccade_count"]
-    features["fix_distance_to_center_mean_px"] = float(np.random.uniform(80, 250))
-    features["fix_distance_to_center_std_px"] = float(np.random.uniform(30, 100))
-    features["fix_spatial_dispersion_px"] = float(np.random.uniform(50, 180))
-    features["gaze_range_x_px"] = float(np.random.uniform(200, 600))
-    features["gaze_range_y_px"] = float(np.random.uniform(150, 450))
-    features["gaze_range_ratio"] = (features["gaze_range_x_px"] * features["gaze_range_y_px"]) / (800 * 600)
-    features["fixation_rate_per_sec"] = features["fix_count"] / (features["fix_duration_total_ms"] / 1000)
-    features["blink_count"] = int(np.random.randint(1, 6))
-    features["blink_duration_mean_ms"] = float(np.random.uniform(100, 300))
-    features["repetitive_scan_index"] = float(np.random.uniform(0.05, 0.35))
-    features["revisit_ratio"] = float(np.random.uniform(0.1, 0.5))
-    features["session_duration_s"] = float(TASK_CONFIGS[task_id]["duration_seconds"])
-
-    # Task-specific features
-    if task_id == "face_preference":
-        features["face_preference_ratio"] = float(np.random.uniform(0.35, 0.80))
-        features["face_dwell_ratio"] = float(np.random.uniform(0.25, 0.60))
-        features["object_dwell_ratio"] = float(np.random.uniform(0.15, 0.50))
-        features["eye_region_fixation_ratio"] = float(np.random.uniform(0.05, 0.30))
-
-    elif task_id == "social_scene":
-        features["face_dwell_ratio"] = float(np.random.uniform(0.15, 0.50))
-        features["eye_region_fixation_ratio"] = float(np.random.uniform(0.08, 0.35))
-        features["object_dwell_ratio"] = float(np.random.uniform(0.10, 0.35))
-        for roi_name in rois:
-            features[f"roi_{roi_name}_dwell_ratio"] = float(np.random.uniform(0.05, 0.40))
-            features[f"roi_{roi_name}_fix_count"] = int(np.random.randint(1, 8))
-            features[f"roi_{roi_name}_first_fix_latency_ms"] = float(np.random.uniform(200, 2000))
-
-    elif task_id == "smooth_pursuit":
-        features["pursuit_accuracy_mean_px"] = float(np.random.uniform(30, 150))
-        features["pursuit_accuracy_std_px"] = float(np.random.uniform(15, 60))
-        features["pursuit_gain"] = float(np.random.uniform(0.5, 1.3))
-
-    elif task_id == "joint_attention":
-        for roi_name in rois:
-            features[f"roi_{roi_name}_dwell_ratio"] = float(np.random.uniform(0.1, 0.5))
-            features[f"roi_{roi_name}_fix_count"] = int(np.random.randint(1, 6))
-            features[f"roi_{roi_name}_first_fix_latency_ms"] = float(np.random.uniform(150, 1500))
-
-    elif task_id == "anti_saccade":
-        features["anti_saccade_correct"] = int(np.random.choice([0, 1], p=[0.3, 0.7]))
-        features["anti_saccade_error"] = 1 - features["anti_saccade_correct"]
-        features["anti_saccade_latency_ms"] = float(np.random.uniform(150, 600))
-
-    elif task_id == "sustained_attention":
-        features["sustained_hits"] = int(np.random.randint(3, 8))
-        features["sustained_misses"] = int(np.random.randint(0, 4))
-        features["sustained_false_alarms"] = int(np.random.randint(0, 3))
-        features["sustained_correct_rejections"] = int(np.random.randint(3, 8))
-        total_t = features["sustained_hits"] + features["sustained_misses"]
-        total_nt = features["sustained_false_alarms"] + features["sustained_correct_rejections"]
-        features["sustained_omission_rate"] = features["sustained_misses"] / total_t if total_t > 0 else 0
-        features["sustained_commission_rate"] = features["sustained_false_alarms"] / total_nt if total_nt > 0 else 0
-        features["sustained_mean_rt_ms"] = float(np.random.uniform(300, 800))
-        features["sustained_d_prime"] = float(np.random.uniform(0.5, 3.0))
-
-    elif task_id == "pattern_recognition":
-        for roi_name in rois:
-            features[f"roi_{roi_name}_dwell_ratio"] = float(np.random.uniform(0.1, 0.4))
-            features[f"roi_{roi_name}_fix_count"] = int(np.random.randint(1, 5))
-            features[f"roi_{roi_name}_first_fix_latency_ms"] = float(np.random.uniform(500, 4000))
-
-    return features
