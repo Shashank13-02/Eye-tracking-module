@@ -228,22 +228,29 @@ def generate_pdf_bytes(report_data):
     except ImportError:
         return None
 
+    def _safe_str(text):
+        if not isinstance(text, str):
+            text = str(text)
+        # Replace common unicode hyphens and quotes before ignoring
+        text = text.replace("—", "-").replace("–", "-").replace("™", "(TM)")
+        return text.encode('latin-1', 'ignore').decode('latin-1')
+
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
     # Title
     pdf.set_font("Helvetica", "B", 20)
-    pdf.cell(0, 12, report_data["title"], new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 12, _safe_str(report_data["title"]), new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 8, report_data["date"], new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 8, _safe_str(report_data["date"]), new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(5)
 
     # Disclaimer
     pdf.set_font("Helvetica", "I", 8)
     pdf.set_text_color(150, 50, 50)
-    pdf.multi_cell(0, 4, "SCREENING AID ONLY - Not a diagnostic instrument. "
-                         "Results require clinical interpretation.")
+    pdf.multi_cell(0, 4, _safe_str("SCREENING AID ONLY - Not a diagnostic instrument. "
+                         "Results require clinical interpretation."))
     pdf.set_text_color(0, 0, 0)
     pdf.ln(5)
 
@@ -253,7 +260,7 @@ def generate_pdf_bytes(report_data):
     pdf.set_font("Helvetica", "", 11)
     child = report_data.get("child", {})
     for key, val in child.items():
-        pdf.cell(0, 7, f"  {key.replace('_', ' ').title()}: {val}",
+        pdf.cell(0, 7, _safe_str(f"  {key.replace('_', ' ').title()}: {val}"),
                  new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
 
@@ -267,7 +274,7 @@ def generate_pdf_bytes(report_data):
         score = score_data.get("score", 0)
         label = score_data.get("label", key)
         pdf.cell(0, 7,
-                 f"  {label}: {score:.1f}/100 [{level}]",
+                 _safe_str(f"  {label}: {score:.1f}/100 [{level}]"),
                  new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
 
@@ -278,20 +285,20 @@ def generate_pdf_bytes(report_data):
     for task_id, task_data in report_data.get("tasks", {}).items():
         pdf.set_font("Helvetica", "B", 11)
         pdf.cell(0, 8,
-                 f"  {task_data.get('icon', '')} {task_data.get('name', task_id)}",
+                 _safe_str(f"  {task_data.get('icon', '')} {task_data.get('name', task_id)}"),
                  new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 10)
 
         summary = task_data.get("summary", {})
         pdf.cell(0, 6,
-                 f"    Fixations: {summary.get('n_fixations', 0)} | "
+                 _safe_str(f"    Fixations: {summary.get('n_fixations', 0)} | "
                  f"Saccades: {summary.get('n_saccades', 0)} | "
-                 f"Duration: {summary.get('duration_s', 0):.1f}s",
+                 f"Duration: {summary.get('duration_s', 0):.1f}s"),
                  new_x="LMARGIN", new_y="NEXT")
 
         for feat_name, feat_val in task_data.get("key_features", {}).items():
             pdf.cell(0, 5,
-                     f"    - {feat_name}: {feat_val}",
+                     _safe_str(f"    - {feat_name}: {feat_val}"),
                      new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
 
@@ -304,7 +311,7 @@ def generate_pdf_bytes(report_data):
     for rec in report_data.get("recommendations", []):
         priority = rec.get("priority", "")
         text = rec.get("text", "")
-        pdf.multi_cell(0, 6, f"  [{priority}] {text}")
+        pdf.multi_cell(0, 6, _safe_str(f"  [{priority}] {text}"))
         pdf.ln(3)
 
     # Footer disclaimer
