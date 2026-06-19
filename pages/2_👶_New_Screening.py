@@ -349,7 +349,9 @@ elif st.session_state.screening_step == "tasks":
     col_stim, col_ctrl = st.columns([3, 1])
 
     with col_stim:
-        # Generate and display stimulus
+        stim_placeholder = st.empty()
+        
+        # Generate and display initial stimulus
         if task_id == "smooth_pursuit":
             t_elapsed = time.time() % cfg["duration_seconds"]
             stimulus = task.get_stimulus(canvas_size=(800, 600), t=t_elapsed)
@@ -367,7 +369,7 @@ elif st.session_state.screening_step == "tasks":
             stimulus = task.get_stimulus(canvas_size=(800, 600))
 
         # Display stimulus image
-        st.image(stimulus, caption=f"Stimulus: {cfg['name']}", use_container_width=True)
+        stim_placeholder.image(stimulus, caption=f"Stimulus: {cfg['name']}", use_container_width=True)
 
     with col_ctrl:
         st.markdown("### Controls")
@@ -389,19 +391,62 @@ elif st.session_state.screening_step == "tasks":
         # Run Task Button
         if st.button(f"▶️ Run & Analyze Task", use_container_width=True, key=f"run_{task_id}"):
             with st.spinner(f"Analyzing {cfg['name']}..."):
-                # Generate simulated features
-                features = _simulate_task_features(task_id, task.get_rois(), 
-                                                    st.session_state.child_info)
-                
-                # Create simulated session data summary
-                session_data = {
-                    "fixations": [],
-                    "saccades": [],
-                    "blinks": [],
-                    "duration_seconds": cfg["duration_seconds"],
-                    "frame_size": (800, 600),
-                }
-                
+                if st.session_state.simulation_mode:
+                    # Generate simulated features
+                    features = _simulate_task_features(task_id, task.get_rois(), 
+                                                        st.session_state.child_info)
+                    
+                    # Create simulated session data summary
+                    session_data = {
+                        "fixations": [],
+                        "saccades": [],
+                        "blinks": [],
+                        "duration_seconds": cfg["duration_seconds"],
+                        "frame_size": (800, 600),
+                    }
+                    time.sleep(0.5)
+                else:
+                    # REAL CAMERA MODE
+                    import cv2
+                    from gaze_analyzer import GazeAnalyzer
+                    
+                    analyzer = GazeAnalyzer()
+                    analyzer.start_session()
+                    
+                    cap = cv2.VideoCapture(0)
+                    if not cap.isOpened():
+                        st.error("Could not open webcam. Ensure no other application is using it.")
+                        features = _simulate_task_features(task_id, task.get_rois(), st.session_state.child_info)
+                        session_data = {}
+                    else:
+                        cam_placeholder = st.empty()
+                        start_t = time.time()
+                        
+                        while time.time() - start_t < cfg["duration_seconds"]:
+                            ret, frame = cap.read()
+                            if not ret: break
+                            
+                            t_elapsed = time.time() - start_t
+                            
+                            # Animate stimulus if smooth pursuit
+                            if task_id == "smooth_pursuit":
+                                stim_frame = task.get_stimulus(canvas_size=(800, 600), t=t_elapsed)
+                                stim_placeholder.image(stim_frame, caption=f"Stimulus: {cfg['name']}", use_container_width=True)
+                            
+                            # Process gaze
+                            frame = cv2.flip(frame, 1)
+                            gp = analyzer.process_frame(frame)
+                            vis = analyzer.draw_overlay(frame, gp)
+                            
+                            cam_placeholder.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+                            
+                        cap.release()
+                        analyzer.end_session()
+                        cam_placeholder.empty()
+                        
+                        session_data = analyzer.get_session_data()
+                        features = aggregate_all_features(session_data, task_rois=task.get_rois())
+
                 # Store features
                 st.session_state.all_task_features[task_id] = features
                 
