@@ -41,7 +41,7 @@ st.set_page_config(page_title=f"{APP_TITLE} — New Screening", page_icon="👶"
 # Load CSS
 css_path = os.path.join(STYLES_DIR, "theme.css")
 if os.path.exists(css_path):
-    with open(css_path, "r") as f:
+    with open(css_path, "r", encoding="utf-8") as f:
         st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
 st.markdown("""
