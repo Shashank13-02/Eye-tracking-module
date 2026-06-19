@@ -1,0 +1,366 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   NeuroScreen — Premium Dashboard Theme
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── CSS Custom Properties ─────────────────────────────────────────── */
+:root {
+    --bg-primary: #0a0e1a;
+    --bg-secondary: #111827;
+    --bg-card: rgba(17, 24, 39, 0.85);
+    --bg-card-hover: rgba(30, 41, 59, 0.9);
+    --bg-glass: rgba(255, 255, 255, 0.03);
+    --border-glass: rgba(255, 255, 255, 0.08);
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent-blue: #3b82f6;
+    --accent-purple: #8b5cf6;
+    --accent-cyan: #06b6d4;
+    --accent-green: #22c55e;
+    --accent-amber: #f59e0b;
+    --accent-red: #ef4444;
+    --gradient-primary: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    --gradient-success: linear-gradient(135deg, #22c55e, #06b6d4);
+    --gradient-warning: linear-gradient(135deg, #f59e0b, #f97316);
+    --gradient-danger: linear-gradient(135deg, #ef4444, #ec4899);
+    --shadow-glow: 0 0 20px rgba(59, 130, 246, 0.15);
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-xl: 20px;
+    --transition-fast: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-smooth: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ── Global Overrides ──────────────────────────────────────────────── */
+.stApp {
+    background: var(--bg-primary) !important;
+    background-image: 
+        radial-gradient(ellipse at 20% 50%, rgba(59, 130, 246, 0.06) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 20%, rgba(139, 92, 246, 0.05) 0%, transparent 50%),
+        radial-gradient(ellipse at 50% 80%, rgba(6, 182, 212, 0.04) 0%, transparent 50%) !important;
+    color: var(--text-primary) !important;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0f1729 0%, #0a0e1a 100%) !important;
+    border-right: 1px solid var(--border-glass) !important;
+}
+
+section[data-testid="stSidebar"] .stMarkdown h1,
+section[data-testid="stSidebar"] .stMarkdown h2,
+section[data-testid="stSidebar"] .stMarkdown h3 {
+    color: var(--text-primary) !important;
+}
+
+/* ── Cards / Containers ────────────────────────────────────────────── */
+div[data-testid="stExpander"] {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-glass) !important;
+    border-radius: var(--radius-md) !important;
+    backdrop-filter: blur(12px) !important;
+    transition: var(--transition-smooth) !important;
+}
+
+div[data-testid="stExpander"]:hover {
+    border-color: rgba(59, 130, 246, 0.2) !important;
+    box-shadow: var(--shadow-glow) !important;
+}
+
+/* Metrics */
+div[data-testid="stMetric"] {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-glass) !important;
+    border-radius: var(--radius-md) !important;
+    padding: 16px 20px !important;
+    backdrop-filter: blur(12px) !important;
+    transition: var(--transition-smooth) !important;
+}
+
+div[data-testid="stMetric"]:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-glow) !important;
+    border-color: rgba(59, 130, 246, 0.25) !important;
+}
+
+div[data-testid="stMetric"] label {
+    color: var(--text-secondary) !important;
+    font-weight: 500 !important;
+    text-transform: uppercase !important;
+    font-size: 0.7rem !important;
+    letter-spacing: 0.05em !important;
+}
+
+div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    color: var(--text-primary) !important;
+    font-weight: 700 !important;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────── */
+.stButton > button {
+    background: var(--gradient-primary) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: var(--radius-sm) !important;
+    padding: 10px 24px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.02em !important;
+    transition: var(--transition-smooth) !important;
+    box-shadow: 0 4px 15px rgba(59, 130, 246, 0.25) !important;
+}
+
+.stButton > button:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 6px 25px rgba(59, 130, 246, 0.35) !important;
+    filter: brightness(1.1) !important;
+}
+
+.stButton > button:active {
+    transform: translateY(0) !important;
+}
+
+/* ── Progress Bar ──────────────────────────────────────────────────── */
+.stProgress > div > div {
+    background: var(--gradient-primary) !important;
+    border-radius: 10px !important;
+}
+
+.stProgress > div {
+    background: var(--bg-glass) !important;
+    border-radius: 10px !important;
+}
+
+/* ── Text Inputs ───────────────────────────────────────────────────── */
+.stTextInput > div > div > input,
+.stNumberInput > div > div > input,
+.stSelectbox > div > div,
+.stTextArea > div > div > textarea {
+    background: var(--bg-secondary) !important;
+    border: 1px solid var(--border-glass) !important;
+    border-radius: var(--radius-sm) !important;
+    color: var(--text-primary) !important;
+    transition: var(--transition-fast) !important;
+}
+
+.stTextInput > div > div > input:focus,
+.stNumberInput > div > div > input:focus,
+.stTextArea > div > div > textarea:focus {
+    border-color: var(--accent-blue) !important;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15) !important;
+}
+
+/* ── Tabs ──────────────────────────────────────────────────────────── */
+.stTabs [data-baseweb="tab-list"] {
+    background: var(--bg-glass) !important;
+    border-radius: var(--radius-md) !important;
+    padding: 4px !important;
+    gap: 2px !important;
+}
+
+.stTabs [data-baseweb="tab"] {
+    border-radius: var(--radius-sm) !important;
+    color: var(--text-secondary) !important;
+    font-weight: 500 !important;
+    transition: var(--transition-fast) !important;
+}
+
+.stTabs [aria-selected="true"] {
+    background: var(--gradient-primary) !important;
+    color: white !important;
+}
+
+/* ── Headers ───────────────────────────────────────────────────────── */
+.stMarkdown h1 {
+    background: var(--gradient-primary);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-weight: 800 !important;
+    letter-spacing: -0.02em !important;
+}
+
+.stMarkdown h2 {
+    color: var(--text-primary) !important;
+    font-weight: 700 !important;
+    border-bottom: 2px solid rgba(59, 130, 246, 0.2);
+    padding-bottom: 8px;
+}
+
+.stMarkdown h3 {
+    color: var(--accent-cyan) !important;
+    font-weight: 600 !important;
+}
+
+/* ── Risk Level Badges ─────────────────────────────────────────────── */
+.risk-badge {
+    display: inline-block;
+    padding: 4px 14px;
+    border-radius: 20px;
+    font-weight: 700;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.risk-low {
+    background: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.risk-moderate {
+    background: rgba(245, 158, 11, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.risk-elevated {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+/* ── Score Card ────────────────────────────────────────────────────── */
+.score-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-glass);
+    border-radius: var(--radius-lg);
+    padding: 24px;
+    backdrop-filter: blur(16px);
+    transition: var(--transition-smooth);
+    position: relative;
+    overflow: hidden;
+}
+
+.score-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: var(--gradient-primary);
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+}
+
+.score-card:hover {
+    border-color: rgba(59, 130, 246, 0.2);
+    box-shadow: var(--shadow-glow);
+    transform: translateY(-2px);
+}
+
+/* ── Disclaimer Banner ─────────────────────────────────────────────── */
+.disclaimer-banner {
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    border-radius: var(--radius-md);
+    padding: 16px 20px;
+    margin: 12px 0;
+    backdrop-filter: blur(8px);
+}
+
+/* ── Task Card ─────────────────────────────────────────────────────── */
+.task-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-glass);
+    border-radius: var(--radius-md);
+    padding: 20px;
+    transition: var(--transition-smooth);
+    cursor: pointer;
+}
+
+.task-card:hover {
+    border-color: rgba(6, 182, 212, 0.3);
+    box-shadow: 0 0 15px rgba(6, 182, 212, 0.1);
+    transform: translateY(-1px);
+}
+
+.task-card .task-icon {
+    font-size: 2rem;
+    margin-bottom: 8px;
+}
+
+.task-card .task-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+}
+
+.task-card .task-desc {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+/* ── Animations ────────────────────────────────────────────────────── */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulseGlow {
+    0%, 100% { box-shadow: 0 0 5px rgba(59, 130, 246, 0.2); }
+    50% { box-shadow: 0 0 20px rgba(59, 130, 246, 0.4); }
+}
+
+@keyframes slideInRight {
+    from { opacity: 0; transform: translateX(20px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+.animate-fade-in {
+    animation: fadeIn 0.5s ease-out forwards;
+}
+
+.animate-pulse {
+    animation: pulseGlow 2s ease-in-out infinite;
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.2);
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(148, 163, 184, 0.35);
+}
+
+/* ── Responsive Adjustments ────────────────────────────────────────── */
+@media (max-width: 768px) {
+    .stApp {
+        padding: 8px !important;
+    }
+
+    div[data-testid="stMetric"] {
+        padding: 12px 14px !important;
+    }
+
+    .score-card {
+        padding: 16px;
+    }
+}
+
+/* ── Plotly Chart Overrides ─────────────────────────────────────────── */
+.js-plotly-plot .plotly .modebar {
+    background: transparent !important;
+}
+
+.js-plotly-plot .plotly .modebar-btn path {
+    fill: var(--text-muted) !important;
+}
+
+/* ── Dataframe Styling ─────────────────────────────────────────────── */
+.stDataFrame {
+    border-radius: var(--radius-md) !important;
+    overflow: hidden !important;
+}
