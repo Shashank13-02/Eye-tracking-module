@@ -26,5 +26,14 @@ wheels/
 screen_position.txt
 screen_position.txt.tmp
 screening_reports/
+research_gaze_streams/
+ground_truth_manifest.csv
+gaze_calibration.json
+camera_intrinsics.json
+screen_geometry.json
+tmp/
+asd.csv
+Autism-Child-Data.csv
+ASD or Autism Screening/
 .idea/
 .vscode/

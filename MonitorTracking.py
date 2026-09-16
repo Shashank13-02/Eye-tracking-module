@@ -12,6 +12,27 @@ import threading
 import keyboard
 from screening_metrics import ScreeningSession, save_report
 from attention_task import VisualAttentionTask, save_task_report
+from tracking_quality import FrameQuality, TrackingQualityMonitor
+from geometry_calibration import FaceGeometryEstimator, load_camera_intrinsics, load_screen_geometry
+from gaze_events import ResearchGazeRecorder
+from age_biomarkers import build_biomarker_report, select_age_band
+from research_tasks import AgeResearchTask
+from calibration_validator import (
+    CALIBRATION_TARGETS,
+    VALIDATION_TARGETS,
+    QUALITY_THRESHOLDS,
+    ValidationMetrics,
+    vector_to_yaw_pitch_deg,
+    compute_calibration_features,
+    fit_gaze_model,
+    select_regularized_gaze_model,
+    robust_target_estimate,
+    predict_screen_coordinates,
+    classify_calibration_quality,
+    evaluate_calibration,
+    save_calibration_profile_v2,
+    load_calibration_profile_v2,
+)
 
 # Screen and mouse control setup (from old script)
 MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
@@ -53,23 +74,44 @@ calibration_offset_pitch = 0
 # --- Multi-point screen calibration state ---
 CALIBRATION_WINDOW = "Gaze Calibration"
 ATTENTION_WINDOW = "Visual Attention Task"
+BIOMARKER_WINDOW = "Age-Banded Research Task"
+AGE_ENTRY_WINDOW = "NeuroGaze Age Setup"
 WEBCAM_WINDOW = "Webcam Feed"
 GAZE_WINDOW = "Integrated Eye Tracking"
 DEBUG_WINDOW = "Head/Eye Debug"
 CALIBRATION_PROFILE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gaze_calibration.json")
-CALIBRATION_TARGETS = [
-    (0.50, 0.50), (0.10, 0.10), (0.90, 0.10), (0.90, 0.90), (0.10, 0.90),
-    (0.50, 0.10), (0.90, 0.50), (0.50, 0.90), (0.10, 0.50),
-]
+CAMERA_INTRINSICS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_intrinsics.json")
+SCREEN_GEOMETRY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screen_geometry.json")
+# Calibration state machine
+CALIB_STAGE_IDLE = 0
+CALIB_STAGE_TRAINING = 1
+CALIB_STAGE_VALIDATING = 2
+CALIB_STAGE_RESULTS = 3
+
+calibration_stage = CALIB_STAGE_IDLE
+multi_calibration_active = False
+
 CALIBRATION_SETTLE_FRAMES = 20
 CALIBRATION_SAMPLES_PER_TARGET = 45
 CALIBRATION_MIN_INLIERS = 25
-multi_calibration_active = False
+
+VALIDATION_SETTLE_FRAMES = 18
+VALIDATION_SAMPLES_PER_TARGET = 40
+VALIDATION_MIN_INLIERS = 22
+
 calibration_target_index = 0
 calibration_settle_frames = 0
 calibration_samples = []
-calibration_observations = []
+
+# Strictly isolated buffers to ensure validation samples are NEVER reused in training
+training_observations = []
+validation_observations = []
+
+training_rmse_val = 0.0
+training_model_selection = None
 calibration_model = None
+latest_validation_metrics = None
+calibration_result_show_time = 0.0
 calibration_status = "Press M after eye calibration to run 9-point screen calibration."
 
 # --- Simple monitor-edge calibration state ---
@@ -102,6 +144,11 @@ print(f"[Startup] Webcam opened: {cap.isOpened()}", flush=True)
 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 print(f"[Startup] Resolution: {w}x{h}", flush=True)
+camera_intrinsics = load_camera_intrinsics(CAMERA_INTRINSICS_FILE, w, h)
+screen_geometry = load_screen_geometry(SCREEN_GEOMETRY_FILE)
+face_geometry = FaceGeometryEstimator(camera_intrinsics, w, h)
+print(f"[Geometry] Camera intrinsics: {'CALIBRATED' if camera_intrinsics else 'APPROXIMATE'} | "
+      f"screen geometry: {'MEASURED' if screen_geometry else 'DEFAULT'}", flush=True)
 cv2.namedWindow(GAZE_WINDOW, cv2.WINDOW_NORMAL)
 cv2.namedWindow(DEBUG_WINDOW, cv2.WINDOW_NORMAL)
 cv2.namedWindow(WEBCAM_WINDOW, cv2.WINDOW_NORMAL)
@@ -188,8 +235,17 @@ nose_indices = [4, 45, 275, 220, 440, 1, 5, 51, 281, 44, 274, 241,
 # ===== NEW: File writing for screen position =====
 screen_position_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screen_position.txt")
 screening_report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screening_reports")
+research_stream_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "research_gaze_streams")
 screening_session = ScreeningSession()
 attention_task = VisualAttentionTask.default()
+research_task = None
+age_entry_active = False
+age_entry_text = ""
+selected_age_months = None
+selected_age_band = None
+age_plan_show_until = 0.0
+quality_monitor = TrackingQualityMonitor()
+event_recorder = ResearchGazeRecorder(research_stream_dir)
 
 def write_screen_position(x, y):
     """Atomically publish the latest screen position for external readers."""
@@ -204,122 +260,298 @@ def write_screen_position(x, y):
 
 def _calibration_features(yaw_deg, pitch_deg):
     """Second-order feature vector for the gaze-to-screen regression."""
-    return np.array([yaw_deg, pitch_deg, yaw_deg * yaw_deg,
-                     yaw_deg * pitch_deg, pitch_deg * pitch_deg, 1.0], dtype=float)
-
-
-def _save_calibration_profile(model, rmse_px):
-    try:
-        profile = {
-            "version": 1,
-            "monitor_size": [MONITOR_WIDTH, MONITOR_HEIGHT],
-            "model": model.tolist(),
-            "rmse_px": float(rmse_px),
-        }
-        temp_file = f"{CALIBRATION_PROFILE_FILE}.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(profile, f, indent=2)
-        os.replace(temp_file, CALIBRATION_PROFILE_FILE)
-    except OSError:
-        pass
+    return compute_calibration_features(yaw_deg, pitch_deg)
 
 
 def load_calibration_profile():
-    """Load a calibration only when it was made for this display size."""
-    global calibration_model, calibration_status
-    try:
-        with open(CALIBRATION_PROFILE_FILE, "r", encoding="utf-8") as f:
-            profile = json.load(f)
-        if profile.get("monitor_size") != [MONITOR_WIDTH, MONITOR_HEIGHT]:
-            return
-        model = np.asarray(profile.get("model"), dtype=float)
-        if model.shape != (6, 2) or not np.all(np.isfinite(model)):
-            return
-        calibration_model = model
-        calibration_status = f"Loaded saved 9-point calibration (fit error {profile.get('rmse_px', 0):.0f}px)."
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass
+    """Load a calibration only when it was made for this display size, supporting v1 and v2 schemas."""
+    global calibration_model, calibration_status, latest_validation_metrics
+    res = load_calibration_profile_v2(CALIBRATION_PROFILE_FILE, MONITOR_WIDTH, MONITOR_HEIGHT)
+    if res is None:
+        return
+    calibration_model = res["model"]
+    calibration_status = res["status_text"]
+    print(f"[Calibration] {calibration_status}")
 
 
 def _show_calibration_target():
-    """Render the current calibration target in a borderless full-screen window."""
-    if not multi_calibration_active:
+    """Render the active calibration target or the results card."""
+    global calibration_stage, multi_calibration_active
+    if calibration_stage == CALIB_STAGE_IDLE:
         return
+
     canvas = np.zeros((MONITOR_HEIGHT, MONITOR_WIDTH, 3), dtype=np.uint8)
-    x_norm, y_norm = CALIBRATION_TARGETS[calibration_target_index]
-    x = int(x_norm * (MONITOR_WIDTH - 1))
-    y = int(y_norm * (MONITOR_HEIGHT - 1))
-    cv2.circle(canvas, (x, y), 22, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.circle(canvas, (x, y), 6, (0, 255, 0), -1, cv2.LINE_AA)
-    message = f"Look at the dot: {calibration_target_index + 1}/{len(CALIBRATION_TARGETS)}"
-    progress = f"Collecting {len(calibration_samples)}/{CALIBRATION_SAMPLES_PER_TARGET} stable samples"
-    cv2.putText(canvas, message, (40, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(canvas, progress, (40, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "Keep your head still. Press Esc to cancel.", (40, 125),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+
+    if calibration_stage == CALIB_STAGE_TRAINING:
+        x_norm, y_norm = CALIBRATION_TARGETS[calibration_target_index]
+        x = int(x_norm * (MONITOR_WIDTH - 1))
+        y = int(y_norm * (MONITOR_HEIGHT - 1))
+        cv2.circle(canvas, (x, y), 24, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(canvas, (x, y), 7, (0, 255, 0), -1, cv2.LINE_AA)
+        message = f"TRAINING: Look at dot {calibration_target_index + 1}/{len(CALIBRATION_TARGETS)}"
+        progress = f"Collecting {len(calibration_samples)}/{CALIBRATION_SAMPLES_PER_TARGET} stable samples"
+        cv2.putText(canvas, message, (40, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, progress, (40, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 120), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "Keep your head steady. Fixate gaze on the center of the dot.", (40, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "Press Esc to cancel.", (40, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1, cv2.LINE_AA)
+
+    elif calibration_stage == CALIB_STAGE_VALIDATING:
+        x_norm, y_norm = VALIDATION_TARGETS[calibration_target_index]
+        x = int(x_norm * (MONITOR_WIDTH - 1))
+        y = int(y_norm * (MONITOR_HEIGHT - 1))
+        cv2.circle(canvas, (x, y), 24, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(canvas, (x, y), 7, (255, 200, 0), -1, cv2.LINE_AA)
+        message = f"INDEPENDENT VALIDATION: Look at dot {calibration_target_index + 1}/{len(VALIDATION_TARGETS)}"
+        progress = f"Evaluating novel target positions {len(calibration_samples)}/{VALIDATION_SAMPLES_PER_TARGET}"
+        cv2.putText(canvas, message, (40, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 200, 0), 2, cv2.LINE_AA)
+        cv2.putText(canvas, progress, (40, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 120), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "Independent evaluation in progress. Keep looking directly at the dot.", (40, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "Press Esc to cancel.", (40, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1, cv2.LINE_AA)
+
+    elif calibration_stage == CALIB_STAGE_RESULTS:
+        if latest_validation_metrics is not None:
+            m = latest_validation_metrics
+            # 1. Draw spatial error vectors on display
+            for s in m.spatial_errors:
+                tx, ty = int(s.target_px[0]), int(s.target_px[1])
+                px, py = int(s.predicted_px[0]), int(s.predicted_px[1])
+                cv2.circle(canvas, (tx, ty), 10, (255, 200, 0), 2, cv2.LINE_AA)
+                cv2.circle(canvas, (tx, ty), 3, (255, 200, 0), -1, cv2.LINE_AA)
+                cv2.drawMarker(canvas, (px, py), (0, 140, 255), cv2.MARKER_TILTED_CROSS, 16, 2, cv2.LINE_AA)
+                cv2.line(canvas, (tx, ty), (px, py), (0, 200, 255), 2, cv2.LINE_AA)
+                cv2.putText(canvas, f"T{s.target_index + 1}: {s.error_px:.0f}px", (tx + 14, ty - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+            # 2. Draw centered Glassmorphic Card
+            card_w, card_h = 720, 430
+            cx, cy = MONITOR_WIDTH // 2, MONITOR_HEIGHT // 2
+            x1, y1 = cx - card_w // 2, cy - card_h // 2
+            x2, y2 = cx + card_w // 2, cy + card_h // 2
+
+            card_overlay = canvas.copy()
+            cv2.rectangle(card_overlay, (x1, y1), (x2, y2), (24, 24, 30), -1)
+            cv2.rectangle(card_overlay, (x1, y1), (x2, y2), (90, 90, 110), 2)
+            cv2.addWeighted(card_overlay, 0.90, canvas, 0.10, 0, canvas)
+
+            # Card Header
+            cv2.putText(canvas, "CALIBRATION QUALITY", (x1 + 30, y1 + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.line(canvas, (x1 + 30, y1 + 54), (x2 - 30, y1 + 54), (80, 80, 100), 1, cv2.LINE_AA)
+
+            # Primary Metric: MEDIAN GAZE ERROR
+            cv2.putText(canvas, "MEDIAN GAZE ERROR", (x1 + 30, y1 + 88),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 190), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"{m.median_px:.1f} px", (x1 + 30, y1 + 135),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
+
+            # STATUS BADGE
+            status_col = (0, 255, 120) if m.status in ("EXCELLENT", "GOOD") else (0, 215, 255) if m.status == "FAIR" else (50, 50, 255)
+            cv2.putText(canvas, f"STATUS: {m.status}", (x1 + 350, y1 + 115),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.85, status_col, 2, cv2.LINE_AA)
+            cv2.putText(canvas, "(Prototype engineering quality gate)", (x1 + 350, y1 + 138),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1, cv2.LINE_AA)
+
+            cv2.line(canvas, (x1 + 30, y1 + 160), (x2 - 30, y1 + 160), (60, 60, 80), 1, cv2.LINE_AA)
+
+            # Detailed Error Statistics
+            row1 = f"RMSE: {m.rmse_px:.1f} px        MAE: {m.mae_px:.1f} px        P95: {m.p95_px:.1f} px"
+            cv2.putText(canvas, row1, (x1 + 30, y1 + 195), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 220, 220), 1, cv2.LINE_AA)
+
+            row2 = f"Horizontal MAE: {m.horizontal_mae_px:.1f} px    Vertical MAE: {m.vertical_mae_px:.1f} px"
+            cv2.putText(canvas, row2, (x1 + 30, y1 + 230), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 220, 220), 1, cv2.LINE_AA)
+
+            row3 = f"Normalized Error: {m.normalized_median_error * 100:.1f} %        Visual Angle: {m.angular_median_error_deg:.1f} deg"
+            cv2.putText(canvas, row3, (x1 + 30, y1 + 265), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 220, 200), 1, cv2.LINE_AA)
+
+            # Spatial breakdown summary
+            spat_str = "Targets: " + "  ".join([f"T{s.target_index + 1}={s.error_px:.0f}px" for s in m.spatial_errors])
+            cv2.putText(canvas, spat_str, (x1 + 30, y1 + 310), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (170, 170, 170), 1, cv2.LINE_AA)
+
+            # Legend
+            cv2.putText(canvas, "Spatial Map: (O) Known Target  -->  (X) Predicted Gaze", (x1 + 30, y1 + 345),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 200, 0), 1, cv2.LINE_AA)
+
+            # Dismiss hint
+            remaining = max(0.0, 7.0 - (time.monotonic() - calibration_result_show_time))
+            cv2.putText(canvas, f"[ SPACE / ENTER ] Return to Tracking (auto-closes in {remaining:.0f}s)",
+                        (x1 + 120, y1 + 395), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Auto close after timeout
+            if remaining <= 0.0:
+                calibration_stage = CALIB_STAGE_IDLE
+                multi_calibration_active = False
+                cv2.destroyWindow(CALIBRATION_WINDOW)
+
     cv2.imshow(CALIBRATION_WINDOW, canvas)
 
 
-def _finish_calibration():
-    global multi_calibration_active, calibration_model, calibration_status
-    features = np.vstack([_calibration_features(yaw, pitch) for yaw, pitch, _ in calibration_observations])
-    targets = np.vstack([target for _, _, target in calibration_observations])
-    model, _, _, _ = np.linalg.lstsq(features, targets, rcond=None)
-    predicted = features @ model
-    rmse_px = float(np.sqrt(np.mean(((predicted - targets) * [MONITOR_WIDTH, MONITOR_HEIGHT]) ** 2)))
+def _finish_training_and_start_validation():
+    """Fit 2nd-order model on training observations and start independent validation."""
+    global calibration_stage, calibration_model, calibration_status
+    global calibration_target_index, calibration_settle_frames, calibration_samples
+    global multi_calibration_active, training_rmse_val, training_model_selection
+
+    features_obs = training_observations
+    model, train_rmse_norm, training_model_selection = select_regularized_gaze_model(features_obs)
+    diag_px = math.sqrt(MONITOR_WIDTH ** 2 + MONITOR_HEIGHT ** 2)
+    training_rmse_val = float(train_rmse_norm * diag_px)
     calibration_model = model
-    multi_calibration_active = False
-    calibration_status = f"9-point calibration complete (fit error {rmse_px:.0f}px)."
-    _save_calibration_profile(model, rmse_px)
-    cv2.destroyWindow(CALIBRATION_WINDOW)
-    print(f"[Calibration] {calibration_status} Saved to {CALIBRATION_PROFILE_FILE}")
+
+    # Transition to independent validation stage
+    calibration_stage = CALIB_STAGE_VALIDATING
+    calibration_target_index = 0
+    calibration_settle_frames = 0
+    calibration_samples = []
+    calibration_status = "Validating calibration against 5 independent targets..."
+    print(f"[Calibration] 9-point training fit complete (training RMSE {training_rmse_val:.1f}px; "
+          f"ridge={training_model_selection.selected_ridge_alpha:g}, "
+          f"LOTO median={training_model_selection.leave_one_target_out_median_error_norm:.4f} normalized).")
+    print("[Calibration] Starting independent 5-target validation (testing novel screen positions)...")
 
 
-def _record_calibration_sample(yaw_deg, pitch_deg):
-    """Collect stable readings and robustly average each target before fitting."""
-    global calibration_target_index, calibration_settle_frames, calibration_samples, calibration_observations
-    if not multi_calibration_active or not (np.isfinite(yaw_deg) and np.isfinite(pitch_deg)):
+def _finish_validation():
+    """Evaluate fitted model against independent validation observations and compute metrics."""
+    global calibration_stage, calibration_status, latest_validation_metrics
+    global calibration_result_show_time, multi_calibration_active
+
+    metrics = evaluate_calibration(
+        calibration_model,
+        validation_observations,
+        MONITOR_WIDTH,
+        MONITOR_HEIGHT,
+        viewing_distance_mm=600.0,
+    )
+    latest_validation_metrics = metrics
+
+    # Save to gaze_calibration.json with Version 2 schema
+    save_calibration_profile_v2(
+        CALIBRATION_PROFILE_FILE,
+        MONITOR_WIDTH,
+        MONITOR_HEIGHT,
+        calibration_model,
+        training_rmse_val,
+        metrics,
+        training_model_selection,
+    )
+
+    calibration_stage = CALIB_STAGE_RESULTS
+    calibration_result_show_time = time.monotonic()
+    calibration_status = (
+        f"Calibration Quality: Median Error {metrics.median_px:.0f}px | Status: {metrics.status}"
+    )
+
+    print("=" * 60)
+    print("CALIBRATION QUALITY EVALUATION (Independent Validation)")
+    print(f"  Median Gaze Error:   {metrics.median_px:.1f} px")
+    print(f"  Status:              {metrics.status}")
+    print(f"  RMSE:                {metrics.rmse_px:.1f} px")
+    print(f"  MAE:                 {metrics.mae_px:.1f} px")
+    print(f"  95th Percentile:     {metrics.p95_px:.1f} px")
+    print(f"  Horizontal MAE:      {metrics.horizontal_mae_px:.1f} px")
+    print(f"  Vertical MAE:        {metrics.vertical_mae_px:.1f} px")
+    print(f"  Normalized Error:    {metrics.normalized_median_error * 100:.2f} %")
+    print(f"  Angular Error:       {metrics.angular_median_error_deg:.2f} deg")
+    for s in metrics.spatial_errors:
+        print(f"    Target {s.target_index + 1} at ({s.target_norm[0]:.2f}, {s.target_norm[1]:.2f}): "
+              f"Error {s.error_px:.1f}px (dx: {s.dx_px:+.1f}px, dy: {s.dy_px:+.1f}px)")
+    print(f"  Saved Version 2 profile to: {CALIBRATION_PROFILE_FILE}")
+    print("=" * 60)
+
+
+def _record_calibration_sample(yaw_deg, pitch_deg, left_locked=True, right_locked=True, left_dir=None, right_dir=None,
+                               frame_quality_ok=True):
+    """Collect stable readings with quality gate filtering for training and validation."""
+    global calibration_target_index, calibration_settle_frames, calibration_samples
+    global training_observations, validation_observations, calibration_stage
+
+    if calibration_stage not in (CALIB_STAGE_TRAINING, CALIB_STAGE_VALIDATING):
         return
-    if calibration_settle_frames < CALIBRATION_SETTLE_FRAMES:
+
+    # 1. Quality Gate: Ensure finite numbers and locked eye spheres
+    if not (np.isfinite(yaw_deg) and np.isfinite(pitch_deg)):
+        return
+    if not (left_locked and right_locked):
+        return
+    if not frame_quality_ok:
+        return
+
+    # 2. Quality Gate: Binocular agreement
+    if left_dir is not None and right_dir is not None:
+        dot = float(np.clip(np.dot(left_dir, right_dir), -1.0, 1.0))
+        # A desk-mounted display is far enough away that the two eye rays should
+        # agree closely.  Rejecting readings below this threshold prevents a
+        # partially occluded iris from disproportionately corrupting vertical
+        # calibration samples.
+        if dot < 0.90:  # > ~26 deg difference between left and right gaze
+            return
+
+    # 3. Settle frames check
+    settle_threshold = CALIBRATION_SETTLE_FRAMES if calibration_stage == CALIB_STAGE_TRAINING else VALIDATION_SETTLE_FRAMES
+    if calibration_settle_frames < settle_threshold:
         calibration_settle_frames += 1
         return
+
+    # 4. Collect samples
+    samples_needed = CALIBRATION_SAMPLES_PER_TARGET if calibration_stage == CALIB_STAGE_TRAINING else VALIDATION_SAMPLES_PER_TARGET
     calibration_samples.append((yaw_deg, pitch_deg))
-    if len(calibration_samples) < CALIBRATION_SAMPLES_PER_TARGET:
+    if len(calibration_samples) < samples_needed:
         return
 
-    samples = np.asarray(calibration_samples, dtype=float)
-    median = np.median(samples, axis=0)
-    mad = np.median(np.abs(samples - median), axis=0)
-    tolerance = np.maximum(3.5 * 1.4826 * mad, 0.08)
-    inliers = samples[np.all(np.abs(samples - median) <= tolerance, axis=1)]
-    if len(inliers) < CALIBRATION_MIN_INLIERS:
+    # 5. Outlier rejection using Median & Median Absolute Deviation (MAD)
+    min_inliers = CALIBRATION_MIN_INLIERS if calibration_stage == CALIB_STAGE_TRAINING else VALIDATION_MIN_INLIERS
+    target_estimate = robust_target_estimate(calibration_samples, min_inliers)
+    if target_estimate is None:
         calibration_samples = []
         calibration_settle_frames = 0
-        print("[Calibration] Too much gaze jitter; recollecting this target.")
+        stage_name = "Training" if calibration_stage == CALIB_STAGE_TRAINING else "Validation"
+        print(f"[{stage_name}] Gaze jitter detected; recollecting this target.")
         return
+    mean_yaw, mean_pitch, inliers = target_estimate
 
-    target = np.asarray(CALIBRATION_TARGETS[calibration_target_index], dtype=float)
-    mean_yaw, mean_pitch = np.mean(inliers, axis=0)
-    calibration_observations.append((float(mean_yaw), float(mean_pitch), target))
-    calibration_target_index += 1
-    calibration_samples = []
-    calibration_settle_frames = 0
-    if calibration_target_index == len(CALIBRATION_TARGETS):
-        _finish_calibration()
+    if calibration_stage == CALIB_STAGE_TRAINING:
+        target = CALIBRATION_TARGETS[calibration_target_index]
+        training_observations.append((float(mean_yaw), float(mean_pitch), target))
+        calibration_target_index += 1
+        calibration_samples = []
+        calibration_settle_frames = 0
+        if calibration_target_index == len(CALIBRATION_TARGETS):
+            _finish_training_and_start_validation()
+
+    elif calibration_stage == CALIB_STAGE_VALIDATING:
+        target = VALIDATION_TARGETS[calibration_target_index]
+        validation_observations.append((float(mean_yaw), float(mean_pitch), target, inliers))
+        calibration_target_index += 1
+        calibration_samples = []
+        calibration_settle_frames = 0
+        if calibration_target_index == len(VALIDATION_TARGETS):
+            _finish_validation()
 
 
 def start_multi_point_calibration():
-    global multi_calibration_active, calibration_target_index, calibration_settle_frames
-    global calibration_samples, calibration_observations, calibration_status
+    global calibration_stage, multi_calibration_active
+    global calibration_target_index, calibration_settle_frames
+    global calibration_samples, training_observations, validation_observations
+    global latest_validation_metrics, calibration_status, training_model_selection
+
+    calibration_stage = CALIB_STAGE_TRAINING
     multi_calibration_active = True
     calibration_target_index = 0
     calibration_settle_frames = 0
     calibration_samples = []
-    calibration_observations = []
-    calibration_status = "9-point calibration in progress."
+    training_observations = []
+    validation_observations = []
+    latest_validation_metrics = None
+    training_model_selection = None
+    calibration_status = "9-point calibration in progress (training)..."
+
     cv2.namedWindow(CALIBRATION_WINDOW, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(CALIBRATION_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    print("[Calibration] Starting 9-point calibration. Keep your head still and follow the dot.")
+    print("[Calibration] Starting 9-point training calibration. Keep your head still and follow the dot.")
+
 
 
 def _show_attention_target():
@@ -343,6 +575,91 @@ def start_attention_task():
     global attention_task
     attention_task = VisualAttentionTask.default()
     attention_task.start(time.monotonic())
+
+
+def start_research_task(module: str):
+    """Start an age-banded research stimulus only during a consented event session."""
+    global research_task
+    if not event_recorder.active:
+        print("[Research Task] Start a consented T research session before starting a task.")
+        return
+    try:
+        if selected_age_months is None:
+            raise ValueError("Enter an age with T before starting a task")
+        band = select_age_band(selected_age_months)
+        research_task = AgeResearchTask(module, band, time.monotonic())
+    except (ValueError, TypeError) as error:
+        print(f"[Research Task] Cannot start: {error}.")
+        return
+    cv2.namedWindow(BIOMARKER_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(BIOMARKER_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    print(f"[Research Task] Started {module} for {band.key}.")
+
+
+def _show_research_task():
+    global research_task
+    if research_task is None:
+        return
+    canvas = research_task.render(MONITOR_WIDTH, MONITOR_HEIGHT, time.monotonic())
+    cv2.imshow(BIOMARKER_WINDOW, canvas)
+    if research_task.finished:
+        cv2.destroyWindow(BIOMARKER_WINDOW)
+        print(f"[Research Task] {research_task.module} complete; end the T session to save its biomarker report.")
+        research_task = None
+
+
+def _show_age_entry():
+    if not age_entry_active:
+        return
+    canvas = np.full((430, 760, 3), 245, dtype=np.uint8)
+    cv2.putText(canvas, "NeuroGaze research session", (45, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
+    cv2.putText(canvas, "Enter child age in whole months (0-72)", (45, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (50, 50, 50), 1)
+    cv2.rectangle(canvas, (45, 160), (710, 230), (255, 255, 255), -1)
+    cv2.rectangle(canvas, (45, 160), (710, 230), (80, 80, 80), 2)
+    cv2.putText(canvas, age_entry_text or "_", (65, 210), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (30, 30, 30), 2)
+    cv2.putText(canvas, "Enter = continue | Backspace = edit | Esc = cancel", (45, 290),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (80, 80, 80), 1)
+    cv2.putText(canvas, "Research measures only: no diagnosis or risk category.", (45, 350),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.47, (0, 110, 200), 1)
+    cv2.imshow(AGE_ENTRY_WINDOW, canvas)
+
+
+def _show_age_plan():
+    if time.monotonic() >= age_plan_show_until or selected_age_band is None:
+        return
+    canvas = np.full((430, 900, 3), 245, dtype=np.uint8)
+    cv2.putText(canvas, f"Age band: {selected_age_band.key}", (40, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (30, 30, 30), 2)
+    if selected_age_band.enabled_tasks:
+        labels = {"face_preference": "1 = face versus non-social preference", "moving_tracking": "2 = moving-object tracking",
+                  "social_gaze_following": "3 = social-cue gaze following"}
+        cv2.putText(canvas, "Available research tasks:", (40, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (40, 40, 40), 1)
+        for index, task in enumerate(selected_age_band.enabled_tasks):
+            cv2.putText(canvas, labels[task], (60, 175 + index * 50), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (20, 110, 40), 1)
+    else:
+        cv2.putText(canvas, "No self-directed screen task is enabled for this age band.", (40, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 110, 200), 1)
+    cv2.putText(canvas, "These produce research measures, not a diagnosis or risk category.", (40, 365),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 110, 200), 1)
+    cv2.imshow(AGE_ENTRY_WINDOW, canvas)
+
+
+def start_research_session_for_age(age_months: int):
+    """Validate explicit in-app age entry, then start a consented research session."""
+    global selected_age_months, selected_age_band, age_plan_show_until
+    consent_confirmed = os.environ.get("NEUROGAZE_CONSENT", "").upper() == "YES"
+    pseudonym = os.environ.get("NEUROGAZE_PARTICIPANT_PSEUDONYM", "")
+    if not consent_confirmed or not pseudonym:
+        print("[Research Stream] Not started. Set NEUROGAZE_CONSENT=YES and a non-identifying "
+              "NEUROGAZE_PARTICIPANT_PSEUDONYM before launching the tracker.")
+        return False
+    selected_age_band = select_age_band(age_months)
+    selected_age_months = age_months
+    session_id = event_recorder.start(time.monotonic(), pseudonym, consent_confirmed=True)
+    screening_session.start(time.monotonic())
+    age_plan_show_until = time.monotonic() + 8.0
+    print(f"[Screening] Research session started ({session_id}) for {selected_age_band.key}. "
+          f"Allowed tasks: {selected_age_band.enabled_tasks or 'none'}; no diagnosis or risk category.")
+    return True
     cv2.namedWindow(ATTENTION_WINDOW, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(ATTENTION_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     print("[Attention Task] Started. Confirm guardian consent and use this only for research metrics, not diagnosis.")
@@ -372,7 +689,8 @@ def _focal_px(width, fov_deg):
 def create_monitor_plane(head_center, R_final, face_landmarks, w, h, 
                          forward_hint=None, gaze_origin=None, gaze_dir=None):
     """
-    Build a 60cm x 40cm plane 50cm in front of the face, in world units.
+    Build a measured monitor plane when setup data exists, otherwise use the legacy
+    60cm x 40cm / 50cm debug-plane fallback.
     Monitor is oriented horizontally like a real monitor (top edge parallel to global X-axis).
     """
     # 1) Estimate scale from chin<->forehead distance
@@ -387,9 +705,12 @@ def create_monitor_plane(head_center, R_final, face_landmarks, w, h,
         upc = 5.0
     
     # 2) Monitor geometry in world units
-    dist_cm = 50.0
-
-    mon_w_cm, mon_h_cm = 60.0, 40.0
+    if screen_geometry is not None:
+        dist_cm = screen_geometry.camera_to_screen_mm / 10.0
+        mon_w_cm, mon_h_cm = screen_geometry.screen_width_mm / 10.0, screen_geometry.screen_height_mm / 10.0
+    else:
+        dist_cm = 50.0
+        mon_w_cm, mon_h_cm = 60.0, 40.0
     half_w = (mon_w_cm * 0.5) * upc
     half_h = (mon_h_cm * 0.5) * upc
 
@@ -404,7 +725,7 @@ def create_monitor_plane(head_center, R_final, face_landmarks, w, h,
 
         # Place the monitor so its center is exactly at some point on the gaze ray
         # For simplicity: choose intersection at 50 cm from head_center along head_forward
-        plane_point = head_center + head_forward * (50.0 * upc)
+        plane_point = head_center + head_forward * (dist_cm * upc)
         plane_normal = head_forward
 
         denom = np.dot(plane_normal, gaze_dir)
@@ -413,10 +734,10 @@ def create_monitor_plane(head_center, R_final, face_landmarks, w, h,
             center_w = gaze_origin + t * gaze_dir
         else:
             # fallback: use fixed distance
-            center_w = head_center + head_forward * (50.0 * upc)
+            center_w = head_center + head_forward * (dist_cm * upc)
     else:
         # fallback: original placement
-        center_w = head_center + head_forward * (50.0 * upc)
+        center_w = head_center + head_forward * (dist_cm * upc)
 
     # Compute right/up using head orientation
     world_up = np.array([0, -1, 0], dtype=float)
@@ -424,6 +745,9 @@ def create_monitor_plane(head_center, R_final, face_landmarks, w, h,
     head_right /= np.linalg.norm(head_right)
     head_up = np.cross(head_forward, head_right)
     head_up /= np.linalg.norm(head_up)
+    if screen_geometry is not None:
+        center_w += head_right * (screen_geometry.camera_offset_x_mm / 10.0) * upc
+        center_w -= head_up * (screen_geometry.camera_offset_y_mm / 10.0) * upc
 
     # Corners
     p0 = center_w - head_right * half_w - head_up * half_h
@@ -621,60 +945,27 @@ def compute_and_draw_coordinate_box(frame, face_landmarks, indices, ref_matrix_c
 
 def convert_gaze_to_screen_coordinates(combined_gaze_direction, calibration_offset_yaw, calibration_offset_pitch):
     """
-    Convert 3D gaze direction vector to 2D screen coordinates
-    This function is adapted from the old script's vector-to-screen mapping logic
+    Convert 3D gaze direction vector to continuous yaw/pitch and screen coordinates.
+    Uses atan2 for continuous signed representation:
+      yaw = atan2(x, -z)
+      pitch = atan2(-y, sqrt(x^2 + z^2))
     """
-    # Reference forward direction (camera looking straight ahead)
-    reference_forward = np.array([0, 0, -1])  # Z-axis into the screen
+    raw_yaw_deg, raw_pitch_deg = vector_to_yaw_pitch_deg(combined_gaze_direction)
 
-    # Normalize the gaze direction
-    avg_direction = combined_gaze_direction / np.linalg.norm(combined_gaze_direction)
-
-    # Horizontal (yaw) angle from reference (project onto XZ plane)
-    xz_proj = np.array([avg_direction[0], 0, avg_direction[2]])
-    xz_proj /= np.linalg.norm(xz_proj)
-    yaw_rad = math.acos(np.clip(np.dot(reference_forward, xz_proj), -1.0, 1.0))
-    if avg_direction[0] < 0:
-        yaw_rad = -yaw_rad  # left is negative
-
-    # Vertical (pitch) angle from reference (project onto YZ plane)
-    yz_proj = np.array([0, avg_direction[1], avg_direction[2]])
-    yz_proj /= np.linalg.norm(yz_proj)
-    pitch_rad = math.acos(np.clip(np.dot(reference_forward, yz_proj), -1.0, 1.0))
-    if avg_direction[1] > 0:
-        pitch_rad = -pitch_rad  # up is positive
-
-    # Convert to degrees and re-center around 0
-    yaw_deg = np.degrees(yaw_rad)
-    pitch_deg = np.degrees(pitch_rad)
-
-    # Convert left rotations to 0-180 (from old script logic)
-    if yaw_deg < 0:
-        yaw_deg = -(yaw_deg)
-    elif yaw_deg > 0:
-        yaw_deg = - yaw_deg
-
-    #yaw is now converted to -90 (looking directly left) to +90 (looking directly right), wrt camera
-    #pitch is now converted to +90 (looking straight up) and -90 (looking straight down), wrt camera
-    
-    raw_yaw_deg = yaw_deg
-    raw_pitch_deg = pitch_deg
-
-    
-    # Specify degrees at which screen border will be reached
+    # Specify degrees at which screen border will be reached (legacy fallback)
     yawDegrees = 5 * 3  # x degrees left or right
     pitchDegrees = 2.0 * 2.5  # x degrees up or down
 
     # Apply calibration offsets
-    yaw_deg += calibration_offset_yaw
-    pitch_deg += calibration_offset_pitch
+    yaw_deg = raw_yaw_deg + calibration_offset_yaw
+    pitch_deg = raw_pitch_deg + calibration_offset_pitch
 
     if calibration_model is not None:
-        mapped_position = _calibration_features(raw_yaw_deg, raw_pitch_deg) @ calibration_model
-        screen_x = int(np.clip(mapped_position[0], 0.0, 1.0) * (MONITOR_WIDTH - 1))
-        screen_y = int(np.clip(mapped_position[1], 0.0, 1.0) * (MONITOR_HEIGHT - 1))
+        screen_x, screen_y, _, _ = predict_screen_coordinates(
+            raw_yaw_deg, raw_pitch_deg, calibration_model, MONITOR_WIDTH, MONITOR_HEIGHT, clip=True
+        )
     else:
-        # Fall back to the original fixed-angle mapping until a 9-point profile exists.
+        # Fall back to the original fixed-angle mapping until a profile exists
         screen_x = int(((yaw_deg + yawDegrees) / (2 * yawDegrees)) * MONITOR_WIDTH)
         screen_y = int(((pitchDegrees - pitch_deg) / (2 * pitchDegrees)) * MONITOR_HEIGHT)
 
@@ -683,6 +974,7 @@ def convert_gaze_to_screen_coordinates(combined_gaze_direction, calibration_offs
     screen_y = max(10, min(screen_y, MONITOR_HEIGHT - 10))
 
     return screen_x, screen_y, raw_yaw_deg, raw_pitch_deg
+
 
 def render_debug_view_orbit(
     h, w,
@@ -965,10 +1257,11 @@ def render_debug_view_orbit(
     cv2.imshow(DEBUG_WINDOW, debug)
 
 
-def draw_efficiency_hud(frame, fps, latency_ms, face_detected, left_locked, right_locked, screen_coords=None, mouse_on=False):
+def draw_efficiency_hud(frame, fps, latency_ms, face_detected, left_locked, right_locked, screen_coords=None,
+                        mouse_on=False, quality: FrameQuality | None = None):
     """Draw a modern HUD overlay displaying real-time efficiency and tracking status."""
     h_f, w_f = frame.shape[:2]
-    hud_h = 64
+    hud_h = 94
     hud_w = min(w_f - 20, 620)
     x0, y0 = 10, 10
 
@@ -981,11 +1274,11 @@ def draw_efficiency_hud(frame, fps, latency_ms, face_detected, left_locked, righ
     # Line 1: FPS, latency, and Always-On-Top indicator
     fps_color = (0, 255, 120) if fps >= 25 else (0, 215, 255) if fps >= 15 else (50, 50, 255)
     fps_text = f"FPS: {fps:4.1f} ({latency_ms:4.1f}ms)"
-    cv2.putText(frame, fps_text, (x0 + 10, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, fps_color, 1, cv2.LINE_AA)
+    cv2.putText(frame, fps_text, (x0 + 10, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.52, fps_color, 1, cv2.LINE_AA)
 
     ontop_text = "On-Top: ON [O]" if always_on_top else "On-Top: OFF [O]"
     ontop_color = (0, 255, 200) if always_on_top else (160, 160, 160)
-    cv2.putText(frame, ontop_text, (x0 + 215, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ontop_color, 1, cv2.LINE_AA)
+    cv2.putText(frame, ontop_text, (x0 + 205, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, ontop_color, 1, cv2.LINE_AA)
 
     # Tracking state
     if not face_detected:
@@ -997,7 +1290,7 @@ def draw_efficiency_hud(frame, fps, latency_ms, face_detected, left_locked, righ
     else:
         status_text = "Tracking: ACTIVE"
         status_color = (0, 255, 0)
-    cv2.putText(frame, status_text, (x0 + 365, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, status_color, 1, cv2.LINE_AA)
+    cv2.putText(frame, status_text, (x0 + 365, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.46, status_color, 1, cv2.LINE_AA)
 
     # Line 2: Gaze coords, mouse status & controls hint
     if screen_coords:
@@ -1005,14 +1298,36 @@ def draw_efficiency_hud(frame, fps, latency_ms, face_detected, left_locked, righ
         gaze_text = f"{prefix}: ({screen_coords[0]}, {screen_coords[1]})"
     else:
         gaze_text = "Gaze Screen: (Searching...)"
-    cv2.putText(frame, gaze_text, (x0 + 10, y0 + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
+    cv2.putText(frame, gaze_text, (x0 + 10, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
 
     mouse_text = f"Mouse: {'ON' if mouse_on else 'OFF'} [F7]"
     mouse_color = (0, 255, 0) if mouse_on else (160, 160, 160)
-    cv2.putText(frame, mouse_text, (x0 + 265, y0 + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45, mouse_color, 1, cv2.LINE_AA)
+    cv2.putText(frame, mouse_text, (x0 + 265, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.44, mouse_color, 1, cv2.LINE_AA)
 
-    hint_text = "[C] Lock Center  [M] 9-Pt  [Q] Quit"
-    cv2.putText(frame, hint_text, (x0 + 410, y0 + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (170, 170, 170), 1, cv2.LINE_AA)
+    if quality is not None:
+        if quality.usable_for_gaze:
+            quality_text, quality_color = "Frame quality: USABLE", (0, 230, 0)
+        else:
+            quality_text = "Frame paused: " + ", ".join(quality.flags[:2])
+            quality_color = (0, 160, 255)
+        cv2.putText(frame, quality_text, (x0 + 10, y0 + 64), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, quality_color, 1, cv2.LINE_AA)
+
+    hint_text = "[C] Lock  [M] Calib  [Q] Quit"
+    cv2.putText(frame, hint_text, (x0 + 410, y0 + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (170, 170, 170), 1, cv2.LINE_AA)
+
+    # Line 3: Calibration Quality Status
+    if latest_validation_metrics is not None:
+        q_text = f"Calib Quality: Median Error {latest_validation_metrics.median_px:.0f}px | Status: {latest_validation_metrics.status}"
+        q_color = (0, 255, 120) if latest_validation_metrics.status in ("EXCELLENT", "GOOD") else (0, 215, 255) if latest_validation_metrics.status == "FAIR" else (50, 50, 255)
+    elif calibration_model is not None:
+        q_text = "Calib Quality: Active (Calibrated Profile)"
+        q_color = (0, 215, 255)
+    else:
+        q_text = "Calib Quality: Uncalibrated [Press M to Calibrate]"
+        q_color = (160, 160, 160)
+    cv2.putText(frame, q_text, (x0 + 10, y0 + 84), cv2.FONT_HERSHEY_SIMPLEX, 0.42, q_color, 1, cv2.LINE_AA)
+
 
 
 
@@ -1032,10 +1347,12 @@ threading.Thread(target=mouse_mover, daemon=True).start()
 left_sphere_locked = False
 left_sphere_local_offset = None
 left_calibration_nose_scale = None
+left_calibration_radius = None
 
 right_sphere_locked = False
 right_sphere_local_offset = None
 right_calibration_nose_scale = None
+right_calibration_radius = None
 
 load_calibration_profile()
 
@@ -1059,6 +1376,8 @@ while cap.isOpened():
     combined_dir = None  # will be filled once you compute a smoothed direction
     face_detected = False
     session_gaze_xy = None
+    screen_coords_for_hud = None
+    frame_quality = quality_monitor.evaluate(frame, None, time.monotonic())
 
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(frame_rgb)
@@ -1066,6 +1385,17 @@ while cap.isOpened():
     if results.multi_face_landmarks:
         face_detected = True
         face_landmarks = results.multi_face_landmarks[0].landmark
+        head_pose = face_geometry.estimate_head_pose(face_landmarks)
+        left_eye_geometry, right_eye_geometry = face_geometry.estimate_eyes(face_landmarks, head_pose)
+        # An uncalibrated solvePnP camera matrix is useful for drawing approximate
+        # geometry, but its Euler angles are not reliable enough to hard-block the
+        # first eye lock.  Let TrackingQualityMonitor use its image-landmark pose
+        # proxy until a measured intrinsics profile is available.
+        pose_degrees = (
+            None if head_pose is None or not head_pose.calibrated_intrinsics
+            else (head_pose.yaw_deg, head_pose.pitch_deg, head_pose.roll_deg)
+        )
+        frame_quality = quality_monitor.evaluate(frame, face_landmarks, time.monotonic(), pose_degrees)
 
         # Index for left iris center point (from MediaPipe's iris model)
         left_iris_idx = 468
@@ -1083,9 +1413,6 @@ while cap.isOpened():
             size=80
         )
 
-        # TODO compute this radius using canthus during calibration
-        base_radius = 20  # radius at calibration distance
-
         x_iris_l = int(left_iris.x * w)
         y_iris_l = int(left_iris.y * h)
         x_iris_r = int(right_iris.x * w)
@@ -1102,10 +1429,10 @@ while cap.isOpened():
             scale_ratio = current_nose_scale / left_calibration_nose_scale if left_calibration_nose_scale else 1.0
             scaled_offset = left_sphere_local_offset * scale_ratio
             sphere_world_l = head_center + R_final @ scaled_offset
-            scaled_radius_l = int(base_radius * scale_ratio)
+            scaled_radius_l = int((left_calibration_radius or left_eye_geometry.radius) * scale_ratio)
         else:
-            sphere_world_l = iris_3d_left + camera_dir_world * base_radius
-            scaled_radius_l = base_radius
+            sphere_world_l = left_eye_geometry.center
+            scaled_radius_l = int(left_eye_geometry.radius)
 
         x_sphere_l, y_sphere_l = int(sphere_world_l[0]), int(sphere_world_l[1])
         sphere_color_l = (255, 255, 25) if left_sphere_locked else (220, 180, 40)
@@ -1116,10 +1443,10 @@ while cap.isOpened():
             scale_ratio_r = current_nose_scale / right_calibration_nose_scale if right_calibration_nose_scale else 1.0
             scaled_offset_r = right_sphere_local_offset * scale_ratio_r
             sphere_world_r = head_center + R_final @ scaled_offset_r
-            scaled_radius_r = int(base_radius * scale_ratio_r)
+            scaled_radius_r = int((right_calibration_radius or right_eye_geometry.radius) * scale_ratio_r)
         else:
-            sphere_world_r = iris_3d_right + camera_dir_world * base_radius
-            scaled_radius_r = base_radius
+            sphere_world_r = right_eye_geometry.center
+            scaled_radius_r = int(right_eye_geometry.radius)
 
         x_sphere_r, y_sphere_r = int(sphere_world_r[0]), int(sphere_world_r[1])
         sphere_color_r = (25, 255, 255) if right_sphere_locked else (220, 180, 40)
@@ -1163,15 +1490,25 @@ while cap.isOpened():
             calibration_offset_yaw, 
             calibration_offset_pitch
         )
-        _record_calibration_sample(raw_yaw, raw_pitch)
-        session_gaze_xy = (screen_x / max(MONITOR_WIDTH - 1, 1), screen_y / max(MONITOR_HEIGHT - 1, 1))
+        _record_calibration_sample(
+            raw_yaw, raw_pitch,
+            left_locked=left_sphere_locked,
+            right_locked=right_sphere_locked,
+            left_dir=left_gaze_dir,
+            right_dir=right_gaze_dir,
+            frame_quality_ok=frame_quality.usable_for_gaze,
+        )
+        if frame_quality.usable_for_gaze:
+            session_gaze_xy = (screen_x / max(MONITOR_WIDTH - 1, 1), screen_y / max(MONITOR_HEIGHT - 1, 1))
+            screen_coords_for_hud = (screen_x, screen_y)
 
-        if mouse_control_enabled and (left_sphere_locked and right_sphere_locked):
+        if mouse_control_enabled and (left_sphere_locked and right_sphere_locked) and frame_quality.usable_for_gaze:
             with mouse_lock:
                 mouse_target[0] = screen_x
                 mouse_target[1] = screen_y
 
-        write_screen_position(screen_x, screen_y)
+        if frame_quality.usable_for_gaze:
+            write_screen_position(screen_x, screen_y)
 
         # Draw combined gaze ray
         combined_origin = (sphere_world_l + sphere_world_r) / 2
@@ -1230,8 +1567,18 @@ while cap.isOpened():
     current_fps = 1.0 / avg_duration if avg_duration > 0 else 0.0
     latency_ms = avg_duration * 1000.0
 
-    screening_session.observe(time.monotonic(), face_detected, session_gaze_xy)
-    if attention_task.observe(time.monotonic(), session_gaze_xy):
+    observation_time = time.monotonic()
+    screening_session.observe(observation_time, face_detected, session_gaze_xy, frame_quality.flags)
+    if research_task is not None:
+        research_stimulus = research_task.stimulus(observation_time)
+        task_event, target_xy = research_stimulus.task_event, research_stimulus.target_xy
+    else:
+        active_trial = attention_task.current_trial
+        task_event = None if active_trial is None else f"visual_attention:{active_trial.trial_id}"
+        target_xy = None if active_trial is None else (active_trial.target_x, active_trial.target_y)
+    event_recorder.observe(observation_time, session_gaze_xy, session_gaze_xy is not None,
+                           frame_quality.flags, task_event, target_xy)
+    if attention_task.observe(observation_time, session_gaze_xy):
         os.makedirs(screening_report_dir, exist_ok=True)
         task_report_path = os.path.join(screening_report_dir, f"attention_task_{int(time.time())}.json")
         save_task_report(attention_task.report(), task_report_path)
@@ -1246,14 +1593,18 @@ while cap.isOpened():
         face_detected=face_detected,
         left_locked=left_sphere_locked,
         right_locked=right_sphere_locked,
-        screen_coords=(screen_x, screen_y) if 'screen_x' in locals() else None,
-        mouse_on=mouse_control_enabled
+        screen_coords=screen_coords_for_hud,
+        mouse_on=mouse_control_enabled,
+        quality=frame_quality,
     )
 
     cv2.imshow(GAZE_WINDOW, frame)
     cv2.imshow(WEBCAM_WINDOW, raw_frame)
     _show_calibration_target()
     _show_attention_target()
+    _show_research_task()
+    _show_age_entry()
+    _show_age_plan()
 
     # Ensure windows pop to the front on early rendered frames
     if frame_count in (1, 3, 5):
@@ -1271,25 +1622,69 @@ while cap.isOpened():
     c_was_pressed = c_pressed
 
     key = cv2.waitKey(1) & 0xFF
-    if key == 27 and multi_calibration_active:
+    if age_entry_active:
+        if key == 27:
+            age_entry_active = False
+            age_entry_text = ""
+            cv2.destroyWindow(AGE_ENTRY_WINDOW)
+            print("[Research Session] Age entry cancelled.")
+        elif key in (8, 127):
+            age_entry_text = age_entry_text[:-1]
+        elif key in (13, 10):
+            try:
+                entered_age = int(age_entry_text)
+                if not 0 <= entered_age <= 72:
+                    raise ValueError
+                if start_research_session_for_age(entered_age):
+                    age_entry_active = False
+                    age_entry_text = ""
+                else:
+                    age_entry_active = False
+                    age_entry_text = ""
+                    cv2.destroyWindow(AGE_ENTRY_WINDOW)
+            except ValueError:
+                print("[Research Session] Enter a whole number from 0 through 72.")
+        elif ord('0') <= key <= ord('9') and len(age_entry_text) < 2:
+            age_entry_text += chr(key)
+        continue
+    if key == 27 and (calibration_stage != CALIB_STAGE_IDLE or multi_calibration_active):
+        calibration_stage = CALIB_STAGE_IDLE
         multi_calibration_active = False
-        calibration_status = "9-point calibration cancelled."
+        calibration_status = "Calibration cancelled."
         cv2.destroyWindow(CALIBRATION_WINDOW)
-        print("[Calibration] 9-point calibration cancelled.")
+        print("[Calibration] Calibration cancelled.")
+    elif (key in (13, 32)) and (calibration_stage == CALIB_STAGE_RESULTS):
+        calibration_stage = CALIB_STAGE_IDLE
+        multi_calibration_active = False
+        cv2.destroyWindow(CALIBRATION_WINDOW)
+        print("[Calibration] Result card dismissed; returning to tracking.")
     elif key == 27 and attention_task.active:
         attention_task.active = False
         cv2.destroyWindow(ATTENTION_WINDOW)
         print("[Attention Task] Cancelled; no report was saved.")
+    elif key == 27 and research_task is not None:
+        research_task = None
+        cv2.destroyWindow(BIOMARKER_WINDOW)
+        print("[Research Task] Cancelled; event stream remains available until the T session ends.")
     elif key == ord('q'):
         break
     elif key == ord('o'):
         always_on_top = not always_on_top
         bring_windows_to_front(topmost=always_on_top)
         print(f"[Window] Always-on-top: {'ENABLED' if always_on_top else 'DISABLED'}", flush=True)
-    elif key == ord('m') and face_detected and left_sphere_locked and right_sphere_locked and not attention_task.active:
+    elif key in (ord('m'), ord('M')) and face_detected and frame_quality.usable_for_gaze and left_sphere_locked and right_sphere_locked and not attention_task.active and research_task is None:
         start_multi_point_calibration()
-    elif key == ord('m'):
-        print("[Calibration] Complete eye-sphere calibration with C while a face is detected first, and finish any attention task.")
+    elif key in (ord('m'), ord('M')):
+        reasons = list(frame_quality.flags)
+        if not face_detected:
+            reasons.append("no_face")
+        if not (left_sphere_locked and right_sphere_locked):
+            reasons.append("press_C_to_lock_eyes")
+        if attention_task.active:
+            reasons.append("attention_task_active")
+        if research_task is not None:
+            reasons.append("research_task_active")
+        print("[Calibration] Cannot start yet: " + ", ".join(dict.fromkeys(reasons)))
     elif key == ord('t'):
         if screening_session.active:
             report = screening_session.stop(time.monotonic())
@@ -1297,29 +1692,48 @@ while cap.isOpened():
             report_path = os.path.join(screening_report_dir, f"screening_report_{int(time.time())}.json")
             save_report(report, report_path)
             print(f"[Screening] Session stopped. Data quality: {report.data_quality}. Report: {report_path}")
+            if event_recorder.active:
+                event_path, event_summary = event_recorder.stop_and_save(time.monotonic())
+                print(f"[Research Stream] Saved consented timestamped gaze events: {event_path} | {event_summary}")
+                try:
+                    if selected_age_months is None:
+                        raise ValueError("No age was selected for this session")
+                    age_months = selected_age_months
+                    with open(event_path, encoding="utf-8") as handle:
+                        biomarker_report = build_biomarker_report(json.load(handle), age_months)
+                    biomarker_path = event_path.replace(".json", "_biomarkers.json")
+                    with open(biomarker_path, "w", encoding="utf-8") as handle:
+                        json.dump(biomarker_report, handle, indent=2)
+                    print(f"[Biomarkers] Saved age-banded research report: {biomarker_path}")
+                except (ValueError, TypeError, OSError, json.JSONDecodeError) as error:
+                    print(f"[Biomarkers] No age-banded report created: {error}")
         else:
-            screening_session.start(time.monotonic())
-            print("[Screening] Session started. By continuing, confirm appropriate guardian consent and local approval. "
-                  "Only derived gaze metrics are retained; this is not a diagnostic assessment.")
-    elif key == ord('v') and face_detected and left_sphere_locked and right_sphere_locked and not multi_calibration_active:
+            age_entry_active = True
+            age_entry_text = ""
+            cv2.namedWindow(AGE_ENTRY_WINDOW, cv2.WINDOW_NORMAL)
+    elif key == ord('v') and face_detected and frame_quality.usable_for_gaze and left_sphere_locked and right_sphere_locked and not multi_calibration_active and research_task is None:
         start_attention_task()
     elif key == ord('v'):
         print("[Attention Task] Complete eye calibration first and do not run it during gaze calibration.")
-    elif (key in (ord('c'), ord('C')) or c_triggered) and face_detected:
+    elif key in (ord('1'), ord('2'), ord('3')) and face_detected and frame_quality.usable_for_gaze and left_sphere_locked and right_sphere_locked and not multi_calibration_active and not attention_task.active and research_task is None:
+        start_research_task({ord('1'): "face_preference", ord('2'): "moving_tracking", ord('3'): "social_gaze_following"}[key])
+    elif (key in (ord('c'), ord('C')) or c_triggered) and face_detected and frame_quality.usable_for_gaze:
         current_nose_scale = compute_scale(nose_points_3d)
         # Lock LEFT eye
-        left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
-        camera_dir_world = np.array([0, 0, 1])
-        camera_dir_local = R_final.T @ camera_dir_world
-        left_sphere_local_offset += base_radius * camera_dir_local
+        left_sphere_local_offset = R_final.T @ (left_eye_geometry.center - head_center)
         left_calibration_nose_scale = current_nose_scale
+        left_calibration_radius = left_eye_geometry.radius
         left_sphere_locked = True
 
         # Lock RIGHT eye
-        right_sphere_local_offset = R_final.T @ (iris_3d_right - head_center)
-        right_sphere_local_offset += base_radius * camera_dir_local  # use same camera_dir_local
+        right_sphere_local_offset = R_final.T @ (right_eye_geometry.center - head_center)
         right_calibration_nose_scale = current_nose_scale
+        right_calibration_radius = right_eye_geometry.radius
         right_sphere_locked = True
+        quality_monitor.mark_calibrated(
+            time.monotonic(), frame_quality.face_size_ratio,
+            (frame_quality.head_yaw_deg, frame_quality.head_pitch_deg, frame_quality.head_roll_deg),
+        )
 
         # === Create 3D monitor plane at calibration ===
         # Compute instantaneous sphere positions at calibration distance (scale=1)

@@ -12,6 +12,12 @@ The current implementation provides:
 - A `V`-key standardized nine-target visual-attention task with per-target latency and on-target engagement summaries.
 - Atomic JSON reports with no captured video, face landmarks, child name, age, or identifier.
 - Data-quality gates for duration, tracked-frame ratio, and usable gaze samples.
+- Frame-level quality gating for face presence, eye visibility, blink proxy, illumination,
+  landmark jitter, head-pose proxies, face-size/distance proxy, and calibration age.
+- Training-only regularized calibration-model selection; independent validation points are
+  held out from selection and remain reserved for engineering evaluation.
+- Consent-gated timestamped research streams and age-banded research task measures for
+  face preference, moving-target tracking, and social-cue gaze following; no risk score.
 
 ## Derived metrics
 

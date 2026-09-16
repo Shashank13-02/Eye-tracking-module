@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -30,6 +30,8 @@ class ScreeningReport:
     gaze_entropy_bits: Optional[float]
     gaze_region_transitions: int
     longest_tracking_gap_seconds: float
+    invalid_gaze_frames: int
+    quality_flag_counts: dict[str, int]
     data_quality: str
     clinical_interpretation: str
     referral_recommendation: str
@@ -47,7 +49,7 @@ class ScreeningSession:
         self._active = False
         self._started_at: Optional[float] = None
         self._last_timestamp: Optional[float] = None
-        self._observations: list[tuple[float, bool, Optional[float], Optional[float]]] = []
+        self._observations: list[tuple[float, bool, Optional[float], Optional[float], tuple[str, ...]]] = []
 
     @property
     def active(self) -> bool:
@@ -64,6 +66,7 @@ class ScreeningSession:
         timestamp: float,
         face_detected: bool,
         gaze_xy: Optional[tuple[float, float]] = None,
+        quality_flags: Sequence[str] = (),
     ) -> None:
         """Record one frame's derived state; raw video and facial landmarks are discarded."""
         if not self._active:
@@ -74,7 +77,7 @@ class ScreeningSession:
             if math.isfinite(candidate_x) and math.isfinite(candidate_y):
                 x = float(np.clip(candidate_x, 0.0, 1.0))
                 y = float(np.clip(candidate_y, 0.0, 1.0))
-        self._observations.append((float(timestamp), bool(face_detected), x, y))
+        self._observations.append((float(timestamp), bool(face_detected), x, y, tuple(quality_flags)))
         self._last_timestamp = float(timestamp)
 
     def stop(self, timestamp: float) -> ScreeningReport:
@@ -96,21 +99,28 @@ class ScreeningSession:
         tracking_ratio = float(np.mean(tracked))
         timestamps = np.array([observation[0] for observation in self._observations], dtype=float)
         gaze = np.array(
-            [(x, y) for _, _, x, y in self._observations if x is not None and y is not None],
+            [(x, y) for _, _, x, y, _ in self._observations if x is not None and y is not None],
             dtype=float,
         )
         longest_gap = self._longest_tracking_gap(timestamps, tracked, end_time)
+        flag_counts: dict[str, int] = {}
+        for _, _, _, _, flags in self._observations:
+            for flag in flags:
+                flag_counts[flag] = flag_counts.get(flag, 0) + 1
+        invalid_frames = sum(1 for _, _, x, y, _ in self._observations if x is None or y is None)
 
         if len(gaze) == 0:
             report_data = asdict(self._empty_report(duration))
             report_data.update(
                 tracking_ratio=tracking_ratio,
                 longest_tracking_gap_seconds=longest_gap,
+                invalid_gaze_frames=invalid_frames,
+                quality_flag_counts=dict(sorted(flag_counts.items())),
             )
             return ScreeningReport(**report_data)
 
         gaze_timestamps = np.array(
-            [timestamp for timestamp, _, x, y in self._observations if x is not None and y is not None],
+            [timestamp for timestamp, _, x, y, _ in self._observations if x is not None and y is not None],
             dtype=float,
         )
         speeds = self._gaze_speeds(gaze, gaze_timestamps)
@@ -133,6 +143,8 @@ class ScreeningSession:
             gaze_entropy_bits=round(entropy, 4),
             gaze_region_transitions=transitions,
             longest_tracking_gap_seconds=round(longest_gap, 3),
+            invalid_gaze_frames=invalid_frames,
+            quality_flag_counts=dict(sorted(flag_counts.items())),
             data_quality=quality,
             clinical_interpretation=(
                 "Research engagement metrics only; not a diagnosis or clinical risk score."
@@ -156,6 +168,8 @@ class ScreeningSession:
             gaze_entropy_bits=None,
             gaze_region_transitions=0,
             longest_tracking_gap_seconds=round(duration, 3),
+            invalid_gaze_frames=0,
+            quality_flag_counts={},
             data_quality="insufficient",
             clinical_interpretation="No usable gaze data was recorded; not clinically interpretable.",
             referral_recommendation="No automated referral recommendation is available.",
