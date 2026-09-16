@@ -76,6 +76,7 @@ CALIBRATION_WINDOW = "Gaze Calibration"
 ATTENTION_WINDOW = "Visual Attention Task"
 BIOMARKER_WINDOW = "Age-Banded Research Task"
 AGE_ENTRY_WINDOW = "NeuroGaze Age Setup"
+RESEARCH_REPORT_WINDOW = "NeuroGaze Research Session Report"
 WEBCAM_WINDOW = "Webcam Feed"
 GAZE_WINDOW = "Integrated Eye Tracking"
 DEBUG_WINDOW = "Head/Eye Debug"
@@ -239,8 +240,15 @@ research_stream_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 screening_session = ScreeningSession()
 attention_task = VisualAttentionTask.default()
 research_task = None
+research_task_queue = []
+research_protocol_pending = False
+research_report_active = False
+research_report_payload = None
 age_entry_active = False
 age_entry_text = ""
+age_entry_step = "age"
+pending_age_months = None
+age_entry_message = ""
 selected_age_months = None
 selected_age_band = None
 age_plan_show_until = 0.0
@@ -581,23 +589,62 @@ def start_attention_task():
     attention_task.start(time.monotonic())
 
 
-def start_research_task(module: str):
-    """Start an age-banded research stimulus only during a consented event session."""
+def _research_tracking_ready() -> bool:
+    """Only collect task data while a usable gaze stream is available."""
+    return bool(face_detected and frame_quality.usable_for_gaze and
+                left_sphere_locked and right_sphere_locked and not multi_calibration_active)
+
+
+def _start_research_task(module: str) -> bool:
+    """Open one permitted research stimulus. The caller has checked readiness."""
     global research_task
+    band = select_age_band(selected_age_months)
+    research_task = AgeResearchTask(module, band, time.monotonic())
+    cv2.namedWindow(BIOMARKER_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(BIOMARKER_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    print(f"[Research Task] Started {module} for {band.key}.")
+    return True
+
+
+def start_research_task(module: str):
+    """Start one chosen age-banded stimulus during a consented session."""
+    global research_task_queue, research_protocol_pending
     if not event_recorder.active:
         print("[Research Task] Start a consented T research session before starting a task.")
-        return
+        return False
     try:
         if selected_age_months is None:
             raise ValueError("Enter an age with T before starting a task")
         band = select_age_band(selected_age_months)
-        research_task = AgeResearchTask(module, band, time.monotonic())
+        if module not in band.enabled_tasks:
+            raise ValueError(f"{module} is not enabled for {band.key}")
     except (ValueError, TypeError) as error:
         print(f"[Research Task] Cannot start: {error}.")
-        return
-    cv2.namedWindow(BIOMARKER_WINDOW, cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty(BIOMARKER_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    print(f"[Research Task] Started {module} for {band.key}.")
+        return False
+    if not _research_tracking_ready():
+        print("[Research Task] Waiting for usable tracking. Centre the child, then press C to lock both eyes.")
+        return False
+    research_task_queue = []
+    research_protocol_pending = False
+    return _start_research_task(module)
+
+
+def start_research_protocol():
+    """Run the short sequence of research tasks enabled for the entered age band."""
+    global research_task_queue, research_protocol_pending
+    if not event_recorder.active or selected_age_band is None:
+        return False
+    if not selected_age_band.enabled_tasks:
+        print(f"[Research Task] No self-directed task is enabled for {selected_age_band.key}.")
+        return False
+    if not _research_tracking_ready():
+        research_protocol_pending = True
+        print("[Research Task] Session is ready. Centre the child and press C to lock the eyes; "
+              "the age-appropriate task sequence will start automatically.")
+        return False
+    research_protocol_pending = False
+    research_task_queue = list(selected_age_band.enabled_tasks)
+    return _start_research_task(research_task_queue.pop(0))
 
 
 def _show_research_task():
@@ -607,25 +654,156 @@ def _show_research_task():
     canvas = research_task.render(MONITOR_WIDTH, MONITOR_HEIGHT, time.monotonic())
     cv2.imshow(BIOMARKER_WINDOW, canvas)
     if research_task.finished:
-        cv2.destroyWindow(BIOMARKER_WINDOW)
-        print(f"[Research Task] {research_task.module} complete; end the T session to save its biomarker report.")
+        completed_module = research_task.module
         research_task = None
+        if research_task_queue:
+            next_module = research_task_queue.pop(0)
+            print(f"[Research Task] {completed_module} complete; starting {next_module}.")
+            _start_research_task(next_module)
+        else:
+            cv2.destroyWindow(BIOMARKER_WINDOW)
+            print(f"[Research Task] {completed_module} complete; finalizing and saving the session automatically.")
+            finalize_research_session("completed_protocol")
+
+
+def _format_research_metric(value) -> str:
+    if value is None:
+        return "not available"
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+def _show_research_report():
+    """Display a participant-facing completion card after files are safely saved."""
+    if not research_report_active or research_report_payload is None:
+        return
+    canvas = np.full((MONITOR_HEIGHT, MONITOR_WIDTH, 3), 24, dtype=np.uint8)
+    left = max(45, MONITOR_WIDTH // 10)
+    top = max(55, MONITOR_HEIGHT // 10)
+    right = min(MONITOR_WIDTH - 45, left + min(1120, MONITOR_WIDTH - 90))
+    bottom = min(MONITOR_HEIGHT - 55, top + min(680, MONITOR_HEIGHT - 110))
+    cv2.rectangle(canvas, (left, top), (right, bottom), (52, 52, 52), -1)
+    cv2.rectangle(canvas, (left, top), (right, bottom), (115, 210, 115), 2)
+    cv2.putText(canvas, "RESEARCH SESSION COMPLETE", (left + 35, top + 65), cv2.FONT_HERSHEY_SIMPLEX,
+                0.9, (150, 255, 150), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "Research observations only - not a diagnosis or clinical risk result.",
+                (left + 35, top + 105), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 205, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"Session data quality: {research_report_payload['screening_data_quality']}",
+                (left + 35, top + 155), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (240, 240, 240), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "JSON output saved locally:", (left + 35, top + 205), cv2.FONT_HERSHEY_SIMPLEX,
+                0.58, (240, 240, 240), 1, cv2.LINE_AA)
+    y = top + 240
+    for label, path in (("Event stream", research_report_payload.get("event_path")),
+                        ("Biomarker report", research_report_payload.get("biomarker_path")),
+                        ("Session report", research_report_payload.get("screening_path"))):
+        text = f"{label}: {os.path.basename(path) if path else 'not saved'}"
+        cv2.putText(canvas, text, (left + 55, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (100, 235, 255) if path else (80, 80, 255), 1, cv2.LINE_AA)
+        y += 34
+    cv2.putText(canvas, "Task marker summary", (left + 35, y + 18), cv2.FONT_HERSHEY_SIMPLEX,
+                0.60, (240, 240, 240), 1, cv2.LINE_AA)
+    y += 55
+    for module in research_report_payload.get("modules", []):
+        metrics = module.get("metrics") or {}
+        details = ", ".join(f"{key}={_format_research_metric(value)}" for key, value in list(metrics.items())[:3])
+        line = f"{module.get('module', 'task')}: {module.get('data_quality', 'unknown')}"
+        if details:
+            line += f" | {details}"
+        cv2.putText(canvas, line[:130], (left + 55, y), cv2.FONT_HERSHEY_SIMPLEX, 0.47,
+                    (220, 220, 220), 1, cv2.LINE_AA)
+        y += 34
+    if research_report_payload.get("error"):
+        cv2.putText(canvas, f"Save note: {research_report_payload['error']}"[:130], (left + 35, bottom - 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (80, 80, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "Press Space, Enter, or Esc to return to tracking.", (left + 35, bottom - 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.imshow(RESEARCH_REPORT_WINDOW, canvas)
+
+
+def finalize_research_session(reason: str) -> bool:
+    """Stop an active research run, write its JSON outputs, and show a completion card."""
+    global research_task, research_protocol_pending, research_report_active, research_report_payload
+    if not screening_session.active:
+        return False
+    research_task = None
+    research_task_queue.clear()
+    research_protocol_pending = False
+    try:
+        cv2.destroyWindow(BIOMARKER_WINDOW)
+    except cv2.error:
+        pass
+
+    os.makedirs(screening_report_dir, exist_ok=True)
+    report = screening_session.stop(time.monotonic())
+    screening_path = os.path.join(screening_report_dir, f"screening_report_{int(time.time())}.json")
+    save_report(report, screening_path)
+    payload = {
+        "reason": reason,
+        "screening_data_quality": report.data_quality,
+        "screening_path": screening_path,
+        "event_path": None,
+        "biomarker_path": None,
+        "modules": [],
+        "error": None,
+    }
+    if event_recorder.active:
+        try:
+            event_path, event_summary = event_recorder.stop_and_save(time.monotonic())
+            payload["event_path"] = event_path
+            print(f"[Research Stream] Saved consented timestamped gaze events: {event_path} | {event_summary}")
+            if selected_age_months is None:
+                raise ValueError("No age was selected for this session")
+            with open(event_path, encoding="utf-8") as handle:
+                biomarker_report = build_biomarker_report(json.load(handle), selected_age_months)
+            biomarker_path = event_path.replace(".json", "_biomarkers.json")
+            with open(biomarker_path, "w", encoding="utf-8") as handle:
+                json.dump(biomarker_report, handle, indent=2)
+            payload["biomarker_path"] = biomarker_path
+            payload["modules"] = biomarker_report.get("modules", [])
+            print(f"[Biomarkers] Saved age-banded research report: {biomarker_path}")
+        except (ValueError, TypeError, OSError, RuntimeError, json.JSONDecodeError) as error:
+            payload["error"] = str(error)
+            print(f"[Biomarkers] Report could not be created: {error}")
+    else:
+        payload["error"] = "The research event recorder was not active."
+
+    research_report_payload = payload
+    research_report_active = True
+    cv2.namedWindow(RESEARCH_REPORT_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(RESEARCH_REPORT_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    print(f"[Research Session] Finalized automatically ({reason}). Session report: {screening_path}")
+    return True
 
 
 def _show_age_entry():
     if not age_entry_active:
         return
     canvas = np.full((430, 760, 3), 245, dtype=np.uint8)
-    cv2.putText(canvas, "NeuroGaze research session", (45, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
-    cv2.putText(canvas, "Enter child age in whole months (0-72)", (45, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (50, 50, 50), 1)
+    cv2.putText(canvas, "NeuroGaze research session", (45, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2)
+    prompts = {
+        "age": ("Step 1 of 3: Enter child age in whole months (0-72)", "Ages 0-8 have no self-directed screen task."),
+        "consent": ("Step 2 of 3: Type YES to confirm guardian consent", "Only continue after the guardian agrees to research recording."),
+        "pseudonym": ("Step 3 of 3: Enter a non-identifying session ID", "Use letters, numbers, hyphens, or underscores only; do not enter a name."),
+    }
+    prompt, help_text = prompts[age_entry_step]
+    cv2.putText(canvas, prompt, (45, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (50, 50, 50), 1)
+    cv2.putText(canvas, help_text, (45, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 110, 200), 1)
     cv2.rectangle(canvas, (45, 160), (710, 230), (255, 255, 255), -1)
     cv2.rectangle(canvas, (45, 160), (710, 230), (80, 80, 80), 2)
     cv2.putText(canvas, age_entry_text or "_", (65, 210), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (30, 30, 30), 2)
     cv2.putText(canvas, "Enter = continue | Backspace = edit | Esc = cancel", (45, 290),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (80, 80, 80), 1)
-    cv2.putText(canvas, "Research measures only: no diagnosis or risk category.", (45, 350),
+    if age_entry_message:
+        cv2.putText(canvas, age_entry_message, (45, 325), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (30, 30, 200), 1)
+    cv2.putText(canvas, "Research measures only: no diagnosis or risk category.", (45, 380),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.47, (0, 110, 200), 1)
     cv2.imshow(AGE_ENTRY_WINDOW, canvas)
+
+
+def _valid_research_pseudonym(value: str) -> bool:
+    """Reject personal-looking/free-form identifiers in the local research recorder."""
+    return 3 <= len(value) <= 80 and all(character.isalnum() or character in "_-" for character in value)
 
 
 def _show_age_plan():
@@ -647,26 +825,22 @@ def _show_age_plan():
     cv2.imshow(AGE_ENTRY_WINDOW, canvas)
 
 
-def start_research_session_for_age(age_months: int):
-    """Validate explicit in-app age entry, then start a consented research session."""
+def start_research_session_for_age(age_months: int, participant_pseudonym: str, consent_confirmed: bool):
+    """Start a consented, pseudonymous research session from the in-app setup flow."""
     global selected_age_months, selected_age_band, age_plan_show_until
-    consent_confirmed = os.environ.get("NEUROGAZE_CONSENT", "").upper() == "YES"
-    pseudonym = os.environ.get("NEUROGAZE_PARTICIPANT_PSEUDONYM", "")
-    if not consent_confirmed or not pseudonym:
-        print("[Research Stream] Not started. Set NEUROGAZE_CONSENT=YES and a non-identifying "
-              "NEUROGAZE_PARTICIPANT_PSEUDONYM before launching the tracker.")
-        return False
+    if not consent_confirmed:
+        raise PermissionError("Guardian consent was not confirmed.")
     selected_age_band = select_age_band(age_months)
     selected_age_months = age_months
-    session_id = event_recorder.start(time.monotonic(), pseudonym, consent_confirmed=True)
+    session_id = event_recorder.start(time.monotonic(), participant_pseudonym, consent_confirmed=True)
     screening_session.start(time.monotonic())
-    age_plan_show_until = time.monotonic() + 8.0
+    # The protocol now starts itself when tracking is ready, so do not leave a
+    # second task-picker window over the participant-facing stimulus window.
+    age_plan_show_until = 0.0
     print(f"[Screening] Research session started ({session_id}) for {selected_age_band.key}. "
           f"Allowed tasks: {selected_age_band.enabled_tasks or 'none'}; no diagnosis or risk category.")
+    start_research_protocol()
     return True
-    cv2.namedWindow(ATTENTION_WINDOW, cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty(ATTENTION_WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    print("[Attention Task] Started. Confirm guardian consent and use this only for research metrics, not diagnosis.")
 
 def _rot_x(a):
     ca, sa = math.cos(a), math.sin(a)
@@ -1573,6 +1747,8 @@ while cap.isOpened():
     latency_ms = avg_duration * 1000.0
 
     observation_time = time.monotonic()
+    if research_protocol_pending and _research_tracking_ready():
+        start_research_protocol()
     screening_session.observe(observation_time, face_detected, session_gaze_xy, frame_quality.flags)
     if research_task is not None:
         research_stimulus = research_task.stimulus(observation_time)
@@ -1602,6 +1778,10 @@ while cap.isOpened():
         mouse_on=mouse_control_enabled,
         quality=frame_quality,
     )
+    if research_protocol_pending:
+        cv2.rectangle(frame, (8, max(140, h - 70)), (min(w - 8, 820), h - 12), (35, 35, 35), -1)
+        cv2.putText(frame, "Research session ready: centre the child and press C; the task sequence will start automatically.",
+                    (18, h - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (80, 230, 255), 1, cv2.LINE_AA)
 
     cv2.imshow(GAZE_WINDOW, frame)
     cv2.imshow(WEBCAM_WINDOW, raw_frame)
@@ -1610,6 +1790,7 @@ while cap.isOpened():
     _show_research_task()
     _show_age_entry()
     _show_age_plan()
+    _show_research_report()
 
     # Ensure windows pop to the front on early rendered frames
     if frame_count in (1, 3, 5):
@@ -1637,26 +1818,60 @@ while cap.isOpened():
         if key == 27:
             age_entry_active = False
             age_entry_text = ""
+            age_entry_step = "age"
+            pending_age_months = None
+            age_entry_message = ""
             cv2.destroyWindow(AGE_ENTRY_WINDOW)
             print("[Research Session] Age entry cancelled.")
         elif key in (8, 127):
             age_entry_text = age_entry_text[:-1]
+            age_entry_message = ""
         elif key in (13, 10):
             try:
-                entered_age = int(age_entry_text)
-                if not 0 <= entered_age <= 72:
-                    raise ValueError
-                if start_research_session_for_age(entered_age):
+                if age_entry_step == "age":
+                    entered_age = int(age_entry_text)
+                    if not 0 <= entered_age <= 72:
+                        raise ValueError
+                    pending_age_months = entered_age
+                    age_entry_step = "consent"
+                    age_entry_text = ""
+                    age_entry_message = ""
+                elif age_entry_step == "consent":
+                    if age_entry_text.strip().upper() != "YES":
+                        age_entry_message = "Type YES only after guardian consent is confirmed."
+                    else:
+                        age_entry_step = "pseudonym"
+                        age_entry_text = ""
+                        age_entry_message = ""
+                elif not _valid_research_pseudonym(age_entry_text.strip()):
+                    age_entry_message = "Use a 3-80 character non-identifying session ID."
+                elif start_research_session_for_age(pending_age_months, age_entry_text.strip(), consent_confirmed=True):
                     age_entry_active = False
                     age_entry_text = ""
-                else:
-                    age_entry_active = False
-                    age_entry_text = ""
+                    age_entry_step = "age"
+                    pending_age_months = None
+                    age_entry_message = ""
                     cv2.destroyWindow(AGE_ENTRY_WINDOW)
-            except ValueError:
-                print("[Research Session] Enter a whole number from 0 through 72.")
-        elif ord('0') <= key <= ord('9') and len(age_entry_text) < 2:
-            age_entry_text += chr(key)
+            except (ValueError, TypeError, PermissionError) as error:
+                age_entry_message = str(error) or "Enter a whole number from 0 through 72."
+                print(f"[Research Session] {age_entry_message}")
+        elif 32 <= key <= 126 and len(age_entry_text) < 80:
+            character = chr(key)
+            if age_entry_step == "age":
+                if character.isdigit() and len(age_entry_text) < 2:
+                    age_entry_text += character
+            elif age_entry_step == "consent":
+                if character.isalpha() and len(age_entry_text) < 3:
+                    age_entry_text += character.upper()
+            elif character.isalnum() or character in "_-":
+                age_entry_text += character
+        continue
+    if research_report_active:
+        if key in (27, 13, 10, 32):
+            research_report_active = False
+            research_report_payload = None
+            cv2.destroyWindow(RESEARCH_REPORT_WINDOW)
+            print("[Research Session] Completion report dismissed; returning to tracking.")
         continue
     if key == 27 and (calibration_stage != CALIB_STAGE_IDLE or multi_calibration_active):
         calibration_stage = CALIB_STAGE_IDLE
@@ -1698,29 +1913,14 @@ while cap.isOpened():
         print("[Calibration] Cannot start yet: " + ", ".join(dict.fromkeys(reasons)))
     elif key == ord('t'):
         if screening_session.active:
-            report = screening_session.stop(time.monotonic())
-            os.makedirs(screening_report_dir, exist_ok=True)
-            report_path = os.path.join(screening_report_dir, f"screening_report_{int(time.time())}.json")
-            save_report(report, report_path)
-            print(f"[Screening] Session stopped. Data quality: {report.data_quality}. Report: {report_path}")
-            if event_recorder.active:
-                event_path, event_summary = event_recorder.stop_and_save(time.monotonic())
-                print(f"[Research Stream] Saved consented timestamped gaze events: {event_path} | {event_summary}")
-                try:
-                    if selected_age_months is None:
-                        raise ValueError("No age was selected for this session")
-                    age_months = selected_age_months
-                    with open(event_path, encoding="utf-8") as handle:
-                        biomarker_report = build_biomarker_report(json.load(handle), age_months)
-                    biomarker_path = event_path.replace(".json", "_biomarkers.json")
-                    with open(biomarker_path, "w", encoding="utf-8") as handle:
-                        json.dump(biomarker_report, handle, indent=2)
-                    print(f"[Biomarkers] Saved age-banded research report: {biomarker_path}")
-                except (ValueError, TypeError, OSError, json.JSONDecodeError) as error:
-                    print(f"[Biomarkers] No age-banded report created: {error}")
+            print("[Research Session] Ending early; saving data collected so far.")
+            finalize_research_session("ended_early_by_operator")
         else:
             age_entry_active = True
             age_entry_text = ""
+            age_entry_step = "age"
+            pending_age_months = None
+            age_entry_message = ""
             cv2.namedWindow(AGE_ENTRY_WINDOW, cv2.WINDOW_NORMAL)
     elif key == ord('v') and face_detected and frame_quality.usable_for_gaze and left_sphere_locked and right_sphere_locked and not multi_calibration_active and research_task is None:
         start_attention_task()
