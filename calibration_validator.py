@@ -270,7 +270,7 @@ def robust_target_estimate(
     samples: list[tuple[float, float]],
     minimum_inliers: int,
     minimum_tolerance_deg: float = 0.08,
-    maximum_inlier_span_deg: float = 2.0,
+    maximum_mad_deg: float = 1.0,
 ) -> tuple[float, float, list[tuple[float, float]]] | None:
     """Return a robust per-target gaze estimate or ``None`` when it is unstable.
 
@@ -292,10 +292,11 @@ def robust_target_estimate(
     inliers = values[np.all(np.abs(values - median) <= tolerance, axis=1)]
     if len(inliers) < minimum_inliers:
         return None
-    # A calibration target should be a fixation, not a slow sweep.  Even if a
-    # broad sweep is internally consistent enough to survive the MAD filter,
-    # recollect it rather than fitting its midpoint as a target measurement.
-    if float(np.max(np.ptp(inliers, axis=0))) > maximum_inlier_span_deg:
+    # A calibration target should be a fixation, not a slow sweep. Use the
+    # robust spread rather than the total range: a single imperfect webcam
+    # frame can have a wide range but should not discard an otherwise stable
+    # target collection.
+    if float(np.max(mad)) > maximum_mad_deg:
         return None
     estimate = np.median(inliers, axis=0)
     return float(estimate[0]), float(estimate[1]), [(float(y), float(p)) for y, p in inliers]

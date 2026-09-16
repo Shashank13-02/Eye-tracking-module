@@ -127,12 +127,13 @@ class TrackingQualityMonitor:
             flags.append("illumination_too_dark")
         elif illumination > self.MAX_ILLUMINATION:
             flags.append("illumination_too_bright")
-        if self._pose_excessive("yaw", abs(yaw) > self.MAX_HEAD_YAW, using_proxy_pose):
-            flags.append("head_yaw_excessive")
-        if self._pose_excessive("pitch", abs(pitch) > self.MAX_HEAD_PITCH, using_proxy_pose):
-            flags.append("head_pitch_excessive")
-        if self._pose_excessive("roll", abs(roll) > self.MAX_HEAD_ROLL, using_proxy_pose):
-            flags.append("head_roll_excessive")
+        for axis, value, limit in (("yaw", yaw, self.MAX_HEAD_YAW), ("pitch", pitch, self.MAX_HEAD_PITCH), ("roll", roll, self.MAX_HEAD_ROLL)):
+            if self._pose_excessive(axis, abs(value) > limit, using_proxy_pose):
+                # Without measured intrinsics this is only a 2D landmark proxy.
+                # Surface a persistent warning, but do not prevent C/M or a
+                # research session based on an unvalidated pseudo-angle.
+                suffix = "_proxy_warning" if using_proxy_pose else "_excessive"
+                flags.append(f"head_{axis}{suffix}")
         if jitter is not None and jitter > self.MAX_JITTER:
             flags.append("landmark_jitter_high")
         if distance_change is not None and distance_change > self.MAX_DISTANCE_CHANGE_RATIO:
@@ -146,7 +147,8 @@ class TrackingQualityMonitor:
 
         # Calibration uses the same physical-quality gates but is allowed before C locks
         # eye spheres.  The caller separately enforces eye-sphere lock when appropriate.
-        blocking = {flag for flag in flags if flag != "not_eye_calibrated"}
+        non_blocking = {"not_eye_calibrated", "head_yaw_proxy_warning", "head_pitch_proxy_warning", "head_roll_proxy_warning"}
+        blocking = {flag for flag in flags if flag not in non_blocking}
         return FrameQuality(
             face_detected=True, face_confidence=None, face_confidence_available=False,
             left_eye_visible=left_visible, right_eye_visible=right_visible, blink=blink,

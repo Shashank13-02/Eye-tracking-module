@@ -68,17 +68,17 @@ class TestTrackingQuality(unittest.TestCase):
         self.assertFalse(q.usable_for_gaze)
         self.assertIn("distance_changed_since_calibration", q.flags)
 
-    def test_proxy_pose_requires_persistent_breach_before_pause(self):
+    def test_proxy_pose_requires_persistence_and_stays_a_nonblocking_warning(self):
         monitor = TrackingQualityMonitor()
         landmarks = face_landmarks()
         landmarks[1] = Landmark(.50, .75)
         first = monitor.evaluate(self.frame, landmarks, 1.0)
         second = monitor.evaluate(self.frame, landmarks, 1.1)
         third = monitor.evaluate(self.frame, landmarks, 1.2)
-        self.assertNotIn("head_pitch_excessive", first.flags)
-        self.assertNotIn("head_pitch_excessive", second.flags)
-        self.assertIn("head_pitch_excessive", third.flags)
-        self.assertFalse(third.usable_for_gaze)
+        self.assertNotIn("head_pitch_proxy_warning", first.flags)
+        self.assertNotIn("head_pitch_proxy_warning", second.flags)
+        self.assertIn("head_pitch_proxy_warning", third.flags)
+        self.assertTrue(third.usable_for_gaze)
 
     def test_calibrated_pose_remains_an_immediate_safety_gate(self):
         monitor = TrackingQualityMonitor()

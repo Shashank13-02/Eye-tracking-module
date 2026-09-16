@@ -92,12 +92,12 @@ calibration_stage = CALIB_STAGE_IDLE
 multi_calibration_active = False
 
 CALIBRATION_SETTLE_FRAMES = 20
-CALIBRATION_SAMPLES_PER_TARGET = 45
-CALIBRATION_MIN_INLIERS = 25
+CALIBRATION_SAMPLES_PER_TARGET = 36
+CALIBRATION_MIN_INLIERS = 20
 
 VALIDATION_SETTLE_FRAMES = 18
-VALIDATION_SAMPLES_PER_TARGET = 40
-VALIDATION_MIN_INLIERS = 22
+VALIDATION_SAMPLES_PER_TARGET = 32
+VALIDATION_MIN_INLIERS = 18
 
 calibration_target_index = 0
 calibration_settle_frames = 0
@@ -406,11 +406,11 @@ def _finish_training_and_start_validation():
     calibration_target_index = 0
     calibration_settle_frames = 0
     calibration_samples = []
-    calibration_status = "Validating calibration against 5 independent targets..."
-    print(f"[Calibration] 9-point training fit complete (training RMSE {training_rmse_val:.1f}px; "
+    calibration_status = f"Validating calibration against {len(VALIDATION_TARGETS)} independent targets..."
+    print(f"[Calibration] {len(CALIBRATION_TARGETS)}-point training fit complete (training RMSE {training_rmse_val:.1f}px; "
           f"ridge={training_model_selection.selected_ridge_alpha:g}, "
           f"LOTO median={training_model_selection.leave_one_target_out_median_error_norm:.4f} normalized).")
-    print("[Calibration] Starting independent 5-target validation (testing novel screen positions)...")
+    print(f"[Calibration] Starting independent {len(VALIDATION_TARGETS)}-target validation (testing novel screen positions)...")
 
 
 def _finish_validation():
@@ -505,10 +505,14 @@ def _record_calibration_sample(yaw_deg, pitch_deg, left_locked=True, right_locke
     min_inliers = CALIBRATION_MIN_INLIERS if calibration_stage == CALIB_STAGE_TRAINING else VALIDATION_MIN_INLIERS
     target_estimate = robust_target_estimate(calibration_samples, min_inliers)
     if target_estimate is None:
-        calibration_samples = []
-        calibration_settle_frames = 0
+        # Do not throw away an entire target after one noisy capture window.
+        # Retain the newest half-window, so a user who is already holding the
+        # dot can recover with a short additional fixation instead of starting
+        # again from zero samples.
+        retain_count = max(min_inliers, samples_needed // 2)
+        calibration_samples = calibration_samples[-retain_count:]
         stage_name = "Training" if calibration_stage == CALIB_STAGE_TRAINING else "Validation"
-        print(f"[{stage_name}] Gaze jitter detected; recollecting this target.")
+        print(f"[{stage_name}] Gaze jitter detected; retaining {len(calibration_samples)} recent samples and waiting for a stable segment.")
         return
     mean_yaw, mean_pitch, inliers = target_estimate
 
@@ -1359,6 +1363,7 @@ load_calibration_profile()
 frame_count = 0
 fps_history = deque(maxlen=30)
 c_was_pressed = False
+m_was_pressed = False
 
 while cap.isOpened():
     loop_start_time = time.perf_counter()
@@ -1620,6 +1625,12 @@ while cap.isOpened():
     c_pressed = keyboard.is_pressed('c')
     c_triggered = (c_pressed and not c_was_pressed)
     c_was_pressed = c_pressed
+    # Calibration previously relied only on cv2.waitKey(), so pressing M while
+    # another window had focus appeared to do nothing.  Match the global C-key
+    # behavior while retaining normal OpenCV keyboard handling.
+    m_pressed = keyboard.is_pressed('m')
+    m_triggered = (m_pressed and not m_was_pressed)
+    m_was_pressed = m_pressed
 
     key = cv2.waitKey(1) & 0xFF
     if age_entry_active:
@@ -1672,9 +1683,9 @@ while cap.isOpened():
         always_on_top = not always_on_top
         bring_windows_to_front(topmost=always_on_top)
         print(f"[Window] Always-on-top: {'ENABLED' if always_on_top else 'DISABLED'}", flush=True)
-    elif key in (ord('m'), ord('M')) and face_detected and frame_quality.usable_for_gaze and left_sphere_locked and right_sphere_locked and not attention_task.active and research_task is None:
+    elif (key in (ord('m'), ord('M')) or m_triggered) and face_detected and frame_quality.usable_for_gaze and left_sphere_locked and right_sphere_locked and not attention_task.active and research_task is None:
         start_multi_point_calibration()
-    elif key in (ord('m'), ord('M')):
+    elif key in (ord('m'), ord('M')) or m_triggered:
         reasons = list(frame_quality.flags)
         if not face_detected:
             reasons.append("no_face")

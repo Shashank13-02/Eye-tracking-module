@@ -41,11 +41,11 @@ The tracking window opens directly in the foreground in Always-On-Top mode so yo
 Notes
 -----
 Make sure you look at screen center when pressing c. The debug view won't render until you do this. Press `m` afterwards to run full screen calibration and validation:
-1. **9-Point Training**: A full-screen dot visits the center, corners, and edge midpoints to fit a second-order polynomial gaze mapping model.
-2. **5-Point Independent Validation**: A separate, disjoint set of 5 target positions (screen quadrants and upper-center) evaluates the model on independent samples.
+1. **13-Point Training**: A full-screen dot visits the centre, corners, edges, and intermediate upper/lower positions to fit a regularized cubic gaze mapping model.
+2. **6-Point Independent Validation**: A separate, disjoint set of six target positions evaluates the model on independent samples.
 3. **Calibration Quality Report**: Displays the primary **Median Gaze Error (px)**, engineering quality status (`EXCELLENT` <=60px, `GOOD` <=110px, `FAIR` <=180px, `POOR` >180px), RMSE, MAE, 95th percentile error, horizontal/vertical errors, normalized screen diagonal error (%), visual angle error (degrees), and an on-screen spatial vector map.
 4. **Version 2 Profile**: Saved to `gaze_calibration.json` with comprehensive training and validation metrics, automatically reloaded on startup.
-5. **Training-only model selection**: Chooses a standardized ridge-regularized quadratic mapping using leave-one-training-target-out error. The five independent validation targets are never used to select the model.
+5. **Training-only model selection**: Chooses a standardized ridge-regularized cubic mapping using leave-one-training-target-out error. The six independent validation targets are never used to select the model.
 Markers (x key) allow quick tests of where the system thinks you are looking.
 
 Screening research metrics
